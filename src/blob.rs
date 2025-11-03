@@ -25,7 +25,7 @@ const LARGE_FILE_THRESHOLD: u64 = 0; // always mmap
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The data of a blob, either owned (small files) or memory mapped (large files).
-pub enum BlobData<'a> {
+pub enum BlobData {
     /// Small blobs – remains as-is.
     Owned(Vec<u8>),
 
@@ -34,10 +34,10 @@ pub enum BlobData<'a> {
 
     /// Bytes that already live inside gix’s pack-file mmap;
     /// we only keep a pointer and length.
-    Borrowed(&'a [u8]),
+    Borrowed(Arc<[u8]>),
 }
 
-impl<'a> AsRef<[u8]> for BlobData<'a> {
+impl AsRef<[u8]> for BlobData {
     fn as_ref(&self) -> &[u8] {
         match self {
             BlobData::Owned(v) => v,
@@ -47,7 +47,7 @@ impl<'a> AsRef<[u8]> for BlobData<'a> {
     }
 }
 
-impl<'a> BlobData<'a> {
+impl BlobData {
     #[inline]
     pub fn len(&self) -> usize {
         self.as_ref().len()
@@ -77,14 +77,13 @@ pub type BlobAppearanceSet = SmallVec<[BlobAppearance; 1]>;
 // Blob
 // -------------------------------------------------------------------------------------------------
 /// A Git blob, storing its SHA-1 id and its contents.
-
-pub struct Blob<'a> {
+pub struct Blob {
     id: OnceCell<BlobId>,
-    data: BlobData<'a>,
+    data: BlobData,
     temp_id: u64,
 }
 
-impl Blob<'_> {
+impl Blob {
     #[inline]
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut file = File::open(&path)?;
@@ -154,7 +153,7 @@ impl Blob<'_> {
     }
 }
 
-impl Drop for Blob<'_> {
+impl Drop for Blob {
     fn drop(&mut self) {
         // For owned data, clear the Vec. For memory-mapped data, the mmap will be unmapped
         // automatically.

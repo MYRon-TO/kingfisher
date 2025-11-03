@@ -70,11 +70,6 @@ pub struct OwnedBlobMatch {
     pub calculated_entropy: f32,
     pub is_base64: bool,
 }
-impl<'a> Matcher<'a> {
-    pub fn get_profiling_report(&self) -> Option<Vec<RuleStats>> {
-        self.profiler.as_ref().map(|p| p.generate_report())
-    }
-}
 impl OwnedBlobMatch {
     pub fn convert_match_to_owned_blobmatch(m: &Match, rule: Arc<Rule>) -> OwnedBlobMatch {
         OwnedBlobMatch {
@@ -105,7 +100,7 @@ impl OwnedBlobMatch {
 
         let mut owned_blob_match = OwnedBlobMatch {
             rule: blob_match.rule,
-            blob_id: blob_match.blob_id.clone(),
+            blob_id: blob_match.blob_id,
             matching_input_offset_span: blob_match.matching_input_offset_span,
             captures: blob_match.captures.clone(),
             validation_response_body: blob_match.validation_response_body,
@@ -139,15 +134,16 @@ impl OwnedBlobMatch {
 /// It is mostly made up of references and small data.
 /// For a representation that is more friendly for human consumption, see
 /// `Match`.
-pub struct BlobMatch<'a> {
+#[derive(Clone)]
+pub struct BlobMatch {
     /// The rule that was matched
     pub rule: Arc<Rule>, // Changed from `&'a Rule` to `Arc<Rule
 
     /// The blob that was matched
-    pub blob_id: &'a BlobId,
+    pub blob_id: BlobId,
 
     /// The matching input in `blob.input`
-    pub matching_input: &'a [u8],
+    pub matching_input: Vec<u8>,
 
     /// The location of the matching input in `blob.input`
     pub matching_input_offset_span: OffsetSpan,
@@ -204,6 +200,11 @@ pub struct Matcher<'a> {
     /// Configuration that controls inline ignore directives
     inline_ignore_config: InlineIgnoreConfig,
 }
+impl<'a> Matcher<'a> {
+    pub fn get_profiling_report(&self) -> Option<Vec<RuleStats>> {
+        self.profiler.as_ref().map(|p| p.generate_report())
+    }
+}
 /// This `Drop` implementation updates the `global_stats` with the local stats
 impl<'a> Drop for Matcher<'a> {
     fn drop(&mut self) {
@@ -213,10 +214,10 @@ impl<'a> Drop for Matcher<'a> {
         }
     }
 }
-pub enum ScanResult<'a> {
+pub enum ScanResult {
     SeenWithMatches,
     SeenSansMatches,
-    New(Vec<BlobMatch<'a>>),
+    New(Vec<BlobMatch>),
 }
 impl<'a> Matcher<'a> {
     /// Create a new `Matcher` from the given `RulesDatabase`.
@@ -294,18 +295,15 @@ impl<'a> Matcher<'a> {
         Ok(())
     }
 
-    pub fn scan_blob<'b>(
+    pub fn scan_blob(
         &mut self,
-        blob: &'b Blob,
+        blob: &Blob,
         origin: &OriginSet,
         lang: Option<String>,
         redact: bool,
         no_dedup: bool,
         no_base64: bool,
-    ) -> Result<ScanResult<'b>>
-    where
-        'a: 'b,
-    {
+    ) -> Result<ScanResult> {
         // Update local stats
         self.local_stats.blobs_seen += 1;
         self.local_stats.bytes_seen += blob.bytes().len() as u64;
@@ -321,7 +319,7 @@ impl<'a> Matcher<'a> {
             .unwrap_or("unknown_file")
             .to_string();
         // Perform the scan
-        self.scan_bytes_raw(&blob.bytes(), &filename)?;
+        self.scan_bytes_raw(blob.bytes(), &filename)?;
 
         // Opportunistically look for standalone Base64 blobs. If neither
         // the raw scan nor this check yields anything, we can return early
@@ -347,8 +345,7 @@ impl<'a> Matcher<'a> {
         let blob_len = blob.len();
 
         let should_run_tree_sitter = blob_len > 0
-            && blob_len <= TREE_SITTER_MAX_LIMIT
-            && blob_len >= TREE_SITTER_MIN_LIMIT
+            && (TREE_SITTER_MIN_LIMIT..=TREE_SITTER_MAX_LIMIT).contains(&blob_len)
             && has_raw_matches
             && lang_hint.is_some()
             && !no_base64; //tree-sitter parsing is turned off when base64 scanning is disabled
@@ -357,7 +354,7 @@ impl<'a> Matcher<'a> {
             lang_hint.and_then(|lang_str| {
                 get_language_and_queries(lang_str).and_then(|(language, queries)| {
                     let checker = Checker { language, rules: queries };
-                    match checker.check(&blob.bytes()) {
+                    match checker.check(blob.bytes()) {
                         Ok(results) => Some(results),
                         Err(e) => {
                             println!("Error in checker.check: {}", e);
@@ -399,7 +396,7 @@ impl<'a> Matcher<'a> {
                 continue;
             }
             filter_match(
-                blob,
+                &blob,
                 rule,
                 re,
                 start_idx_usize,
@@ -557,14 +554,14 @@ fn record_match(
 ) -> bool {
     insert_span(map.entry(rule_id).or_default(), span)
 }
-fn filter_match<'b>(
-    blob: &'b Blob,
+fn filter_match(
+    blob: &Blob,
     // rule: &'b Rule,
     rule: Arc<Rule>,
     re: &Regex,
     start: usize,
     end: usize,
-    matches: &mut Vec<BlobMatch<'b>>,
+    matches: &mut Vec<BlobMatch>,
     previous_matches: &mut FxHashMap<usize, Vec<OffsetSpan>>,
     rule_id: usize,
     seen_matches: &mut FxHashSet<u64>,
@@ -626,8 +623,8 @@ fn filter_match<'b>(
         let groups = SerializableCaptures::from_captures(&captures, haystack, re, redact);
         matches.push(BlobMatch {
             rule: Arc::clone(&rule),
-            blob_id: blob.id_ref(),
-            matching_input: only_matching_input,
+            blob_id: blob.id(),
+            matching_input: only_matching_input.to_vec(),
             matching_input_offset_span,
             captures: groups,
             validation_response_body: String::new(),
@@ -889,7 +886,7 @@ impl Match {
 
     /// Returns the `blob_id` of the match.
     pub fn get_blob_id(&self) -> BlobId {
-        self.blob_id.clone()
+        self.blob_id
     }
 
     pub fn finding_id(&self) -> String {

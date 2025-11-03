@@ -46,7 +46,7 @@ use crate::{
     PathBuf,
 };
 
-type OwnedBlob = Blob<'static>;
+type OwnedBlob = Blob;
 
 pub fn enumerate_filesystem_inputs(
     args: &scan::ScanArgs,
@@ -299,7 +299,7 @@ struct FileResultIter<'a> {
 }
 
 impl<'a> ParallelIterator for FileResultIter<'a> {
-    type Item = Result<(OriginSet, Blob<'a>)>;
+    type Item = Result<(OriginSet, Blob)>;
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
     where
@@ -467,7 +467,7 @@ impl ParallelBlobIterator for GitRepoResult {
 }
 
 impl<'a> rayon::iter::ParallelIterator for GitRepoResultIter<'a> {
-    type Item = Result<(OriginSet, Blob<'a>)>;
+    type Item = Result<(OriginSet, Blob)>;
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
     where
@@ -551,7 +551,7 @@ enum FoundInputIter<'a> {
 //   around, hence used here -- another format like Arrow or msgpack would be much more efficient)
 
 impl<'a> ParallelIterator for EnumeratorFileIter<'a> {
-    type Item = Result<(OriginSet, Blob<'a>)>;
+    type Item = Result<(OriginSet, Blob)>;
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
     where
@@ -578,7 +578,7 @@ impl<'a> ParallelIterator for EnumeratorFileIter<'a> {
 trait ParallelBlobIterator {
     /// The concrete parallel iterator returned by `into_blob_iter`.
     /// It is generic over the lifetime `'a` that the produced `Blob<'a>` carries.
-    type Iter<'a>: ParallelIterator<Item = Result<(OriginSet, Blob<'a>)>> + 'a
+    type Iter<'a>: ParallelIterator<Item = Result<(OriginSet, Blob)>> + 'a
     where
         Self: 'a;
     /// Convert the input into an *optional* parallel iterator of `(Origin, Blob)` tuples.
@@ -588,7 +588,7 @@ trait ParallelBlobIterator {
 }
 
 impl<'a> ParallelIterator for FoundInputIter<'a> {
-    type Item = Result<(OriginSet, Blob<'a>)>;
+    type Item = Result<(OriginSet, Blob)>;
 
     fn drive_unindexed<C>(self, consumer: C) -> C::Result
     where
