@@ -77,7 +77,7 @@ impl OwnedBlobMatch {
             blob_id: m.blob_id,
             finding_fingerprint: m.finding_fingerprint,
             // matching_input: m.snippet.matching.0.to_vec(),
-            matching_input_offset_span: m.location.offset_span.clone(),
+            matching_input_offset_span: m.location.offset_span,
             captures: m.groups.clone(),
             validation_response_body: m.validation_response_body.clone(),
             validation_response_status: StatusCode::from_u16(m.validation_response_status)
@@ -94,9 +94,9 @@ impl OwnedBlobMatch {
             .captures
             .captures
             .get(1)
-            .or_else(|| blob_match.captures.captures.get(0))
+            .or_else(|| blob_match.captures.captures.first())
             .map(|capture| capture.value.as_bytes().to_vec())
-            .unwrap_or_else(Vec::new);
+            .unwrap_or_default();
 
         let mut owned_blob_match = OwnedBlobMatch {
             rule: blob_match.rule,
@@ -166,6 +166,42 @@ struct UserData {
     /// The length of the input being scanned
     input_len: u64,
 }
+
+// -------------------------------------------------------------------------------------------------
+// REFACTOR: Pipeline Definitions
+// -------------------------------------------------------------------------------------------------
+
+/// 'static 的、拥有其所有数据的匹配候选者。
+/// 它已经通过了最初的零拷贝“粗筛”，准备好进入可组合的“精筛”管道。
+struct FindingCandidate {
+    rule: Arc<Rule>,
+    rule_id_usize: usize,
+    blob_id: BlobId,
+    /// 关键的“拥有”数据：这是从 &[u8] 拷贝而来的
+    finding_bytes: Vec<u8>,
+    /// 立即创建的序列化捕获组
+    captures: SerializableCaptures,
+    /// 在“粗筛”时计算的元数据
+    finding_span_in_blob: OffsetSpan,
+    calculated_entropy: f32,
+    is_base64: bool,
+}
+
+/// 包含所有过滤器可能需要的上下文和可变状态。
+struct FilterContext<'ctx> {
+    /// 原始 Blob 的字节，用于 inline_ignore 等检查
+    blob_bytes: &'ctx [u8],
+    inline_ignore_config: &'ctx InlineIgnoreConfig,
+
+    /// 可变的状态，用于有状态的过滤器
+    seen_matches: &'ctx mut FxHashSet<u64>,
+    previous_matches: &'ctx mut FxHashMap<usize, Vec<OffsetSpan>>,
+}
+
+/// “统一风格的函数”：一个可组合的过滤器函数。
+/// 它接收一个候选者和一个可变的上下文，并返回 'true' (保留) 或 'false' (丢弃)。
+type FilterFn = Box<dyn Fn(&FindingCandidate, &mut FilterContext) -> bool>;
+
 // -------------------------------------------------------------------------------------------------
 // Matcher
 // -------------------------------------------------------------------------------------------------
@@ -339,8 +375,8 @@ impl<'a> Matcher<'a> {
         }
 
         let rules_db = self.rules_db;
-        let mut seen_matches = FxHashSet::default();
-        let mut previous_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
+        // let mut seen_matches = FxHashSet::default(); // DEFERRED
+        // let mut previous_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default(); // DEFERRED
 
         let blob_len = blob.len();
 
@@ -367,7 +403,7 @@ impl<'a> Matcher<'a> {
             None
         };
         // Process matches
-        let mut matches = Vec::new();
+        // let mut matches = Vec::new(); // DEFERRED
         let owned_ts_results = tree_sitter_result.map(|ts_results| {
             ts_results
                 .into_iter()
@@ -382,7 +418,14 @@ impl<'a> Matcher<'a> {
                 })
                 .collect::<Vec<_>>()
         });
+
+        // -------------------------------------------------------------------------------------
+        // REFACTOR: 1. 收集所有“有希望的”候选者
+        // -------------------------------------------------------------------------------------
+        let mut all_candidates: Vec<FindingCandidate> = Vec::new();
         let mut previous_raw_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
+
+        // --- 1a. 处理 Vectorscan (Raw) 匹配 ---
         for &RawMatch { rule_id, start_idx, end_idx } in
             self.user_data.raw_matches_scratch.iter().rev()
         {
@@ -395,54 +438,46 @@ impl<'a> Matcher<'a> {
             if !record_match(&mut previous_raw_matches, rule_id_usize, current_span) {
                 continue;
             }
-            filter_match(
-                &blob,
+
+            let haystack = &blob.bytes()[start_idx_usize..end_idx_usize];
+            all_candidates.extend(generate_and_promote_candidates(
+                blob.id(),
                 rule,
                 re,
-                start_idx_usize,
-                end_idx_usize,
-                &mut matches,
-                &mut previous_matches,
                 rule_id_usize,
-                &mut seen_matches,
-                origin,
-                None,
-                false,
                 redact,
+                haystack,
+                start_idx_usize,
+                false, // is_base64
                 &filename,
                 self.profiler.as_ref(),
-                &self.inline_ignore_config,
-            );
+            ));
         }
-        // If tree-sitter produced base64-decoded matches, try them against all rules
+
+        // --- 1b. 处理 Tree-Sitter 解码的匹配 ---
         if let Some(ref ts_results) = owned_ts_results {
             for (ts_range, ts_match, is_base64_decoded, _original_base64) in ts_results.iter() {
                 if *is_base64_decoded {
                     for (rule_id_usize, rule) in rules_db.rules.iter().enumerate() {
                         let re = &rules_db.anchored_regexes[rule_id_usize];
-                        filter_match(
-                            blob,
+                        all_candidates.extend(generate_and_promote_candidates(
+                            blob.id(),
                             rule.clone(),
                             re,
-                            ts_range.start,
-                            ts_range.end,
-                            &mut matches,
-                            &mut previous_matches,
                             rule_id_usize,
-                            &mut seen_matches,
-                            origin,
-                            Some(ts_match.as_bytes()),
-                            *is_base64_decoded,
                             redact,
+                            ts_match.as_bytes(),
+                            ts_range.start,
+                            true, // is_base64
                             &filename,
                             self.profiler.as_ref(),
-                            &self.inline_ignore_config,
-                        );
+                        ));
                     }
                 }
             }
         }
 
+        // --- 1c. 处理独立 Base64 解码的匹配 ---
         if !no_base64 {
             // If the blob contains standalone Base64 blobs, decode and scan them as well
             const MAX_B64_DEPTH: usize = 2; // decode at most two levels deep
@@ -451,24 +486,18 @@ impl<'a> Matcher<'a> {
             while let Some((item, depth)) = b64_stack.pop() {
                 for (rule_id_usize, rule) in rules_db.rules.iter().enumerate() {
                     let re = &rules_db.anchored_regexes[rule_id_usize];
-                    filter_match(
-                        blob,
+                    all_candidates.extend(generate_and_promote_candidates(
+                        blob.id(),
                         rule.clone(),
                         re,
-                        item.pos_start,
-                        item.pos_end,
-                        &mut matches,
-                        &mut previous_matches,
                         rule_id_usize,
-                        &mut seen_matches,
-                        origin,
-                        Some(item.decoded.as_bytes()),
-                        true,
                         redact,
+                        item.decoded.as_bytes(),
+                        item.pos_start,
+                        true, // is_base64
                         &filename,
                         self.profiler.as_ref(),
-                        &self.inline_ignore_config,
-                    );
+                    ));
                 }
                 if depth + 1 < MAX_B64_DEPTH {
                     for nested in get_base64_strings(item.decoded.as_bytes()) {
@@ -485,8 +514,52 @@ impl<'a> Matcher<'a> {
                 }
             }
         }
+
+        // -------------------------------------------------------------------------------------
+        // REFACTOR: 2. 定义可组合的“精筛”管道
+        // -------------------------------------------------------------------------------------
+        let mut seen_matches = FxHashSet::default();
+        let mut previous_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
+
+        let mut filter_context = FilterContext {
+            blob_bytes: blob.bytes(),
+            inline_ignore_config: &self.inline_ignore_config,
+            seen_matches: &mut seen_matches,
+            previous_matches: &mut previous_matches,
+        };
+
+        // ★ 这就是你的可组合管道！★
+        // 你可以轻松地添加、删除、重新排序这些过滤器。
+        let filters: Vec<FilterFn> = vec![
+            Box::new(filter_inline_ignore),
+            Box::new(filter_hash_dedup),
+            Box::new(filter_overlap_dedup),
+            // ★ 要添加新功能，只需： Box::new(my_new_filter_function), ★
+        ];
+
+        // -------------------------------------------------------------------------------------
+        // REFACTOR: 3. 执行管道
+        // -------------------------------------------------------------------------------------
+        let final_matches: Vec<BlobMatch> = all_candidates
+            .into_iter()
+            .filter(|candidate| {
+                // 对每个 candidate 运行所有过滤器
+                for filter in filters.iter() {
+                    if !filter(candidate, &mut filter_context) {
+                        return false; // 任何一个过滤器失败，则丢弃
+                    }
+                }
+                true // 存活
+            })
+            .map(convert_candidate_to_blob_match) // 转换为最终的 BlobMatch
+            .collect();
+
+        // -------------------------------------------------------------------------------------
+        // REFACTOR: 4. 返回最终结果
+        // -------------------------------------------------------------------------------------
+
         // Finalize
-        if !no_dedup && !matches.is_empty() {
+        if !no_dedup && !final_matches.is_empty() {
             let blob_id = blob.id();
             if let Some(had_matches) = self.seen_blobs.insert(blob_id, true) {
                 return Ok(if had_matches {
@@ -506,8 +579,7 @@ impl<'a> Matcher<'a> {
             self.user_data.raw_matches_scratch.shrink_to_fit();
         }
 
-        Ok(ScanResult::New(matches))
-        // Ok(result)
+        Ok(ScanResult::New(final_matches))
     }
 }
 
@@ -554,91 +626,139 @@ fn record_match(
 ) -> bool {
     insert_span(map.entry(rule_id).or_default(), span)
 }
-fn filter_match(
-    blob: &Blob,
-    // rule: &'b Rule,
+
+// -------------------------------------------------------------------------------------------------
+// REFACTOR: 阶段 1 (粗筛) + 阶段 2 (提升)
+// -------------------------------------------------------------------------------------------------
+
+/// 取代 filter_match。
+/// 执行“零拷贝粗筛”，并通过廉价的 Arc::slice “提升”候选者。
+fn generate_and_promote_candidates<'a>(
+    blob_id: BlobId,
     rule: Arc<Rule>,
     re: &Regex,
-    start: usize,
-    end: usize,
-    matches: &mut Vec<BlobMatch>,
-    previous_matches: &mut FxHashMap<usize, Vec<OffsetSpan>>,
-    rule_id: usize,
-    seen_matches: &mut FxHashSet<u64>,
-    _origin: &OriginSet,
-    ts_match: Option<&[u8]>,
-    is_base64: bool,
+    rule_id_usize: usize,
     redact: bool,
+    // 零拷贝数据
+    haystack: &'a [u8],
+    haystack_start_in_blob: usize,
+    is_base64: bool,
+    // Profiling
     filename: &str,
-    profiler: Option<&Arc<ConcurrentRuleProfiler>>,
-    inline_ignore_config: &InlineIgnoreConfig,
-) {
+    profiler: Option<&'a Arc<ConcurrentRuleProfiler>>,
+) -> Vec<FindingCandidate> {
     let mut timer =
         profiler.map(|p| RuleTimer::new(p, rule.id(), rule.name(), &rule.syntax.pattern, filename));
 
-    let initial_len = matches.len();
-
-    let blob_bytes = blob.bytes();
-    let default_slice = &blob_bytes[start..end];
-    let haystack = ts_match.unwrap_or(default_slice);
+    let mut promoted_candidates = Vec::new();
 
     for captures in re.captures_iter(haystack) {
         let full_capture = captures.get(0).unwrap();
         let matching_input = captures.get(1).unwrap_or(full_capture);
-        let min_entropy = rule.min_entropy();
-        let mi_bytes = matching_input.as_bytes();
-        let full_bytes = full_capture.as_bytes();
+        let mi_bytes = matching_input.as_bytes(); // 零拷贝切片
+
+        // --- 阶段 1: 零拷贝粗筛 (在 Arc 创建前) ---
         let calculated_entropy = calculate_shannon_entropy(mi_bytes);
-        if calculated_entropy <= min_entropy
-            || is_safe_match(mi_bytes)
-            || is_user_match(mi_bytes, full_bytes)
-        {
+        if calculated_entropy <= rule.min_entropy() {
             debug!(
                 "Skipping match with entropy {} <= {} or safe match",
-                calculated_entropy, min_entropy
+                calculated_entropy,
+                rule.min_entropy()
             );
             continue;
         }
-        let matching_input_offset_span = OffsetSpan::from_range(
-            (start + matching_input.start())..(start + matching_input.end()),
+        if is_safe_match(mi_bytes) || is_user_match(mi_bytes, full_capture.as_bytes()) {
+            debug!("Skipping match due to safe list or user match");
+            continue;
+        }
+
+        // --- 阶段 2: “提升” (支付 Vec<u8> 拷贝代价) ---
+        let finding_span_in_blob = OffsetSpan::from_range(
+            (haystack_start_in_blob + matching_input.start())
+                ..(haystack_start_in_blob + matching_input.end()),
         );
-        if inline_ignore_config.should_ignore(blob_bytes, &matching_input_offset_span) {
-            debug!("Skipping match due to inline ignore directive");
-            continue;
-        }
-        let match_key = compute_match_key(
-            matching_input.as_bytes(),
-            rule.id().as_bytes(),
-            matching_input_offset_span.start,
-            matching_input_offset_span.end,
-        );
-        if !seen_matches.insert(match_key) {
-            continue;
-        }
-        if !record_match(previous_matches, rule_id, matching_input_offset_span) {
-            continue;
-        }
-        let only_matching_input =
-            &blob.bytes()[matching_input_offset_span.start..matching_input_offset_span.end];
+
+        // 仅在“提升”时创建捕获组
         let groups = SerializableCaptures::from_captures(&captures, haystack, re, redact);
-        matches.push(BlobMatch {
-            rule: Arc::clone(&rule),
-            blob_id: blob.id(),
-            matching_input: only_matching_input.to_vec(),
-            matching_input_offset_span,
+
+        promoted_candidates.push(FindingCandidate {
+            rule: rule.clone(),
+            rule_id_usize,
+            blob_id,
+            finding_bytes: mi_bytes.to_vec(), // ★ 唯一的昂贵拷贝 ★
             captures: groups,
-            validation_response_body: String::new(),
-            validation_response_status: StatusCode::from_u16(0).unwrap_or(StatusCode::CONTINUE),
-            validation_success: false,
+            finding_span_in_blob,
             calculated_entropy,
             is_base64,
         });
     }
+
     if let Some(t) = timer.take() {
-        let new_count = (matches.len() - initial_len) as u64;
+        let new_count = promoted_candidates.len() as u64;
         t.end(new_count > 0, new_count, 0);
     }
+
+    promoted_candidates
 }
+
+// -------------------------------------------------------------------------------------------------
+// REFACTOR: 阶段 3 (精筛) 的可组合过滤器
+// -------------------------------------------------------------------------------------------------
+
+/// 过滤器：检查行内忽略指令
+#[inline]
+fn filter_inline_ignore(candidate: &FindingCandidate, ctx: &mut FilterContext) -> bool {
+    if ctx.inline_ignore_config.should_ignore(ctx.blob_bytes, &candidate.finding_span_in_blob) {
+        debug!("Skipping match due to inline ignore directive");
+        false // 丢弃
+    } else {
+        true // 保留
+    }
+}
+
+/// 过滤器：执行基于哈希的去重
+#[inline]
+fn filter_hash_dedup(candidate: &FindingCandidate, ctx: &mut FilterContext) -> bool {
+    let match_key = compute_match_key(
+        &candidate.finding_bytes, // ★ 在这里使用拷贝的数据 ★
+        candidate.rule.id().as_bytes(),
+        candidate.finding_span_in_blob.start,
+        candidate.finding_span_in_blob.end,
+    );
+    ctx.seen_matches.insert(match_key) // .insert() 返回 'true' 如果是新值
+}
+
+/// 过滤器：执行基于重叠 Span 的去重
+#[inline]
+fn filter_overlap_dedup(candidate: &FindingCandidate, ctx: &mut FilterContext) -> bool {
+    record_match(ctx.previous_matches, candidate.rule_id_usize, candidate.finding_span_in_blob)
+    // record_match() 返回 'true' 如果是新 span
+}
+
+// -------------------------------------------------------------------------------------------------
+// REFACTOR: 辅助转换函数
+// -------------------------------------------------------------------------------------------------
+
+/// 辅助函数，将我们管道中的数据转换为最终的返回类型
+fn convert_candidate_to_blob_match(cand: FindingCandidate) -> BlobMatch {
+    BlobMatch {
+        rule: cand.rule,
+        blob_id: cand.blob_id,
+        matching_input: cand.finding_bytes, // ★ 直接移动 Vec<u8> ★
+        matching_input_offset_span: cand.finding_span_in_blob,
+        captures: cand.captures,
+        validation_response_body: String::new(),
+        validation_response_status: StatusCode::from_u16(0).unwrap_or(StatusCode::CONTINUE),
+        validation_success: false,
+        calculated_entropy: cand.calculated_entropy,
+        is_base64: cand.is_base64,
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// (以下函数保持不变)
+// -------------------------------------------------------------------------------------------------
+
 fn get_language_and_queries(lang: &str) -> Option<(Language, FxHashMap<String, String>)> {
     match lang.to_lowercase().as_str() {
         "bash" | "shell" => Some((Language::Bash, parser::queries::bash::get_bash_queries())),
@@ -845,7 +965,7 @@ impl Match {
             .captures
             .captures
             .get(1)
-            .or_else(|| owned_blob_match.captures.captures.get(0))
+            .or_else(|| owned_blob_match.captures.captures.first())
             .map(|capture| capture.value.as_bytes())
             .unwrap_or_default();
 
