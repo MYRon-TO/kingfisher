@@ -101,7 +101,7 @@ pub fn enumerate_filesystem_inputs(
         ProgressBar::hidden()
     };
     let _input_enumerator = || -> Result<FilesystemEnumerator> {
-        let mut ie = FilesystemEnumerator::new(input_roots, &args)?;
+        let mut ie = FilesystemEnumerator::new(input_roots, args)?;
         ie.threads(args.num_jobs);
         ie.max_filesize(args.content_filtering_args.max_file_size_bytes());
         if args.input_specifier_args.git_history == GitHistoryMode::None {
@@ -161,10 +161,10 @@ pub fn enumerate_filesystem_inputs(
     let scanner_pool = Arc::new(ScannerPool::new(Arc::new(rules_db.vsdb.clone())));
 
     let matcher = Matcher::new(
-        &rules_db,
+        rules_db,
         scanner_pool.clone(),
         &seen_blobs,
-        Some(&matcher_stats),
+        Some(matcher_stats),
         enable_profiling,
         Some(shared_profiler),
         &args.extra_ignore_comments,
@@ -207,7 +207,7 @@ pub fn enumerate_filesystem_inputs(
                 } else {
                     false
                 };
-                let is_binary = is_binary(&blob.bytes());
+                let is_binary = is_binary(blob.bytes());
                 let should_skip = if is_archive {
                     // For archives: skip only if --no_extract_archives is true
                     args.content_filtering_args.no_extract_archives
@@ -273,7 +273,7 @@ fn make_fs_enumerator(
     if input_roots.is_empty() {
         Ok(None)
     } else {
-        let mut ie = FilesystemEnumerator::new(&input_roots, &args)?;
+        let mut ie = FilesystemEnumerator::new(&input_roots, args)?;
         ie.threads(args.num_jobs);
         ie.max_filesize(args.content_filtering_args.max_file_size_bytes());
         if args.input_specifier_args.git_history == GitHistoryMode::None {

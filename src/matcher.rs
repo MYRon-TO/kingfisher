@@ -143,7 +143,7 @@ pub struct BlobMatch {
     pub blob_id: BlobId,
 
     /// The matching input in `blob.input`
-    pub matching_input: Vec<u8>,
+    // pub matching_input: Vec<u8>,
 
     /// The location of the matching input in `blob.input`
     pub matching_input_offset_span: OffsetSpan,
@@ -171,23 +171,76 @@ struct UserData {
 // REFACTOR: Pipeline Definitions
 // -------------------------------------------------------------------------------------------------
 
-/// 一个临时的、零拷贝的候选者，用于在过滤管道中传递。
-/// 它的生命周期 'a 绑定到 `captures_iter` 所在的 `haystack`。
+/// 一个临时的、零拷贝的匹配候选者，用于在过滤管道中高效传递。
+///
+/// `LightweightCandidate` 的核心设计理念是 **零拷贝 (zero-copy)**。
+/// 它通过持有对原始数据（如 `Blob` 的字节内容或解码后的 Base64 字符串）的 **引用 (references/slices)**，
+/// 而不是复制数据本身，来避免在过滤阶段产生不必要的内存分配和拷贝开销。
+///
+/// 只有当一个 `LightweightCandidate` 成功通过所有过滤规则后，它才会被“提升”（promote）
+/// 为一个拥有自己数据的 `BlobMatch` 结构体。
+///
+/// 它的生命周期 `'a` 绑定到其引用的 `haystack` 的生命周期。
 struct LightweightCandidate<'a> {
     // --- 零拷贝数据 (引用) ---
-    finding_bytes: &'a [u8],      // 密钥 (group 1 or 0)
-    full_capture_bytes: &'a [u8], // 完整匹配 (group 0)
-    captures: &'a Captures<'a>,   // 原始捕获组
-    haystack: &'a [u8],           // 被搜索的字符串
-    re: &'a Regex,                // 使用的正则表达式
+    /// **最关键的匹配内容**，通常是正则表达式的 **第一个捕获组 (group 1)**。
+    ///
+    /// 这代表着我们真正关心的“秘密”（secret）本身。如果第一个捕获组不存在，
+    /// 它会回退到使用整个匹配（group 0）。它是计算熵、检查安全列表等操作的主要对象。
+    /// `finding_bytes` 是 `haystack` 的一个子切片。
+    finding_bytes: &'a [u8],
+
+    /// 正则表达式的 **完整匹配内容 (group 0)**。
+    ///
+    /// 它提供了比 `finding_bytes` 更广泛的上下文，可用于需要查看秘密周围字符的场景
+    /// （例如，在 `is_user_match` 中）。`full_capture_bytes` 也是 `haystack` 的一个子切片。
+    full_capture_bytes: &'a [u8],
+
+    /// `regex` 包返回的原始捕获组对象。
+    ///
+    /// 这是一个低级结构，包含了所有捕获组（包括命名和未命名的）的详细信息
+    /// （如位置和内容），其本身也是对 `haystack` 的引用。
+    captures: &'a Captures<'a>,
+
+    /// **被正则表达式搜索的文本块**，即“干草堆”。
+    ///
+    /// 它是一个数据切片（slice），其内容可能是原始 `blob` 的一部分，
+    /// 也可能是一个解码后的 Base64 字符串。`finding_bytes` 和 `full_capture_bytes`
+    /// 都是 `haystack` 的子切片。
+    haystack: &'a [u8],
+
+    /// 指向用于查找此候选者的那个已编译的正则表达式的引用。
+    re: &'a Regex,
+
     // --- 上下文 (廉价拷贝) ---
+    /// 指向触发这次匹配的 `Rule` 对象的原子引用计数指针。
+    ///
+    /// 使用 `Arc` 可以在多个线程和结构体之间安全、廉价地共享规则的所有权。
     rule: Arc<Rule>,
+
+    /// 规则的数字 ID。
+    ///
+    /// 在 `HashMap` 或 `Vec` 中用作键或索引，比使用字符串 ID 更高效。
     rule_id_usize: usize,
+
+    /// 当前正在扫描的 `Blob` 的唯一标识符。这是一个可以廉价拷贝的类型。
     blob_id: BlobId,
+
+    /// 一个布尔标志，如果 `haystack` 是从 Base64 字符串解码而来的，则为 `true`。
     is_base64: bool,
+
+    /// 一个布尔标志，指示在最终报告中是否应将匹配值编辑或遮盖掉。
     redact: bool,
+
     // --- 预计算数据 ---
+    /// `finding_bytes` 在 **整个原始 `Blob`** 中的绝对字节偏移范围（起始和结束位置）。
+    ///
+    /// 这对于后续的定位、去重和应用行内忽略规则（inline ignore）至关重要。
     finding_span_in_blob: OffsetSpan,
+
+    /// 预先计算好的 `finding_bytes` 的香农熵。
+    ///
+    /// 由于熵计算相对耗时，预先计算可以避免在过滤管道的多个步骤中重复计算。
     calculated_entropy: f32,
 }
 
@@ -203,9 +256,6 @@ struct FilterContext<'ctx> {
 }
 
 /// “统一风格的函数”：一个可组合的、零拷贝的过滤器函数。
-///
-/// ★ REFACTOR: 修正了 `type` 别名，使用了您提供的 `for<...>` (HRTB) 语法。★
-/// 这使其可以被存储在 Vec 中，并接受任何传入的生命周期。
 type ZeroCopyFilterFn =
     Box<dyn for<'a, 'ctx> Fn(&LightweightCandidate<'a>, &mut FilterContext<'ctx>) -> bool>;
 
@@ -425,6 +475,10 @@ impl<'a> Matcher<'a> {
                 })
                 .collect::<Vec<_>>()
         });
+
+        // ====================================================================================
+        // 阶段2: 过滤
+        // ====================================================================================
 
         // -------------------------------------------------------------------------------------
         // REFACTOR: 1. 设置管道
@@ -660,7 +714,7 @@ fn process_captures_pipeline<'a, 'ctx>(
     matches: &mut Vec<BlobMatch>,
     // --- 状态 & 管道 ---
     filter_context: &mut FilterContext<'ctx>,
-    filters: &[ZeroCopyFilterFn], // ★ 使用修正后的 type 别名
+    filters: &[ZeroCopyFilterFn],
 ) {
     let mut timer =
         profiler.map(|p| RuleTimer::new(p, rule.id(), rule.name(), &rule.syntax.pattern, filename));
@@ -702,10 +756,8 @@ fn process_captures_pipeline<'a, 'ctx>(
         }
 
         // -----------------------------------------------------------------
-        // REFACTOR: 阶段 3: 提升 (Promote)
+        // REFACTOR: 阶段 3: 提升 (代价高昂)
         // -----------------------------------------------------------------
-        // 只有通过所有过滤器的候选者才会到达这里。
-        // 现在我们支付昂贵的拷贝代价。
         let final_match = promote_to_blob_match(&candidate);
         matches.push(final_match);
     }
@@ -716,24 +768,19 @@ fn process_captures_pipeline<'a, 'ctx>(
     }
 }
 
-// -------------------------------------------------------------------------------------------------
-// REFACTOR: 阶段 3: 提升 (Promotion)
-// -------------------------------------------------------------------------------------------------
-
-/// 辅助函数：执行昂贵的拷贝操作，将零拷贝的候选者转换为拥有的 `BlobMatch`。
+/// 将零拷贝的候选者转换为拥有的 `BlobMatch`。
 /// 这只在所有过滤器都通过后才被调用。
 fn promote_to_blob_match(cand: &LightweightCandidate) -> BlobMatch {
-    // 昂贵的操作 1: 拷贝 `finding_bytes`
-    let owned_matching_input = cand.finding_bytes.to_vec();
+    // let owned_matching_input = cand.finding_bytes.to_vec();
 
-    // 昂贵的操作 2: 创建 `SerializableCaptures`
+    // WARNING: 非常昂贵的操作，优化重点
     let groups =
         SerializableCaptures::from_captures(cand.captures, cand.haystack, cand.re, cand.redact);
 
     BlobMatch {
         rule: cand.rule.clone(),
         blob_id: cand.blob_id,
-        matching_input: owned_matching_input,
+        // matching_input: owned_matching_input,
         matching_input_offset_span: cand.finding_span_in_blob,
         captures: groups,
         validation_response_body: String::new(),

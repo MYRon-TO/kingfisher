@@ -126,6 +126,7 @@ impl Blob {
         self.temp_id
     }
 
+    /// NOTE: Blob 在这里诞生
     /// Create a new `Blob` from a vector of bytes.
     #[inline]
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
