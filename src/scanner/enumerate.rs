@@ -169,6 +169,7 @@ pub fn enumerate_filesystem_inputs(
         Some(shared_profiler),
         &args.extra_ignore_comments,
         args.no_inline_ignore,
+        args.no_base64,
     )?;
     let blob_processor_init_time = Mutex::new(t1.elapsed());
     let make_blob_processor = || -> BlobProcessor {

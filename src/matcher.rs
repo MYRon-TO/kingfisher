@@ -8,7 +8,7 @@ use anyhow::Result;
 use base64::{engine::general_purpose, Engine};
 use bstr::BString;
 use http::StatusCode;
-use regex::bytes::{Captures, Regex}; // 显式导入 Captures
+use regex::bytes::{Captures, Regex};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use schemars::{
     gen::SchemaGenerator,
@@ -26,7 +26,7 @@ use crate::{
     inline_ignore::InlineIgnoreConfig,
     location::{Location, LocationMapping, OffsetSpan, SourcePoint, SourceSpan},
     origin::OriginSet,
-    parser,
+    parser, // 确保导入了 parser 模块
     parser::{Checker, Language},
     rule_profiling::{ConcurrentRuleProfiler, RuleStats, RuleTimer},
     rules::rule::Rule,
@@ -168,7 +168,178 @@ struct UserData {
 }
 
 // -------------------------------------------------------------------------------------------------
-// REFACTOR: Pipeline Definitions
+// REFACTOR: 生产者 (Producer) 抽象
+// -------------------------------------------------------------------------------------------------
+
+/// 生产者“生产”出的零拷贝 haystack。
+/// 'a 是 haystack 切片所借用的数据的生命周期。
+pub struct Haystack<'a> {
+    /// 零拷贝的数据切片 (可能是原始 blob 的一部分，或解码后的字符串)。
+    pub data: &'a [u8],
+    /// `data` 在 *整个原始 Blob* 中的绝对起始字节偏移量。
+    pub start_offset_in_blob: usize,
+    /// 此数据是否来自 Base64 解码？
+    pub is_base64: bool,
+}
+
+/// 生产者“生产”出的扫描目标。
+/// 'a 的生命周期同上。
+pub enum ScanTarget<'a> {
+    /// 针对此 haystack 运行 *所有规则*。
+    /// (用于 Tree-Sitter, Base64, 和未来的 Producer D, E, F)
+    AllRules(Haystack<'a>),
+    /// 仅针对此 haystack 运行 *特定规则*。
+    /// (主要用于 Vectorscan 的 RawMatch)
+    SpecificRule { haystack: Haystack<'a>, rule_id_usize: usize },
+}
+
+/// 传递给每个生产者的只读上下文。
+/// 'ctx 生命周期绑定到 `scan_blob` 的局部变量。
+pub struct ProducerContext<'ctx> {
+    blob: &'ctx Blob,
+    filename: &'ctx str,
+    lang_hint: &'ctx Option<String>,
+    /// Vectorscan 的原始匹配结果，供 RawScanProducer 使用。
+    raw_matches: &'ctx [RawMatch],
+    /// Tree-Sitter 的解析结果，供 TreeSitterProducer 使用。
+    /// ★ 修正 #1：使用 'parser::MatchResult' ★
+    tree_sitter_results: &'ctx Option<Vec<parser::MatchResult>>,
+}
+
+/// 任何“秘密发现机制”都必须实现的 Trait（零拷贝版本）
+pub trait HaystackProducer: Send + Sync {
+    /// 生产者的名字 (用于调试/日志)。
+    fn name(&self) -> &'static str;
+
+    /// 生产 haystacks 并 *立即* 将它们（作为切片）喂给消费者。
+    /// ★ 修正 #3：简化 'produce' 签名 ★
+    fn produce<'ctx>(
+        &self,
+        context: &'ctx ProducerContext<'ctx>,
+        consumer: &mut dyn FnMut(ScanTarget<'_>),
+    );
+}
+
+// --- 生产者 A: RawScanProducer ---
+struct RawScanProducer;
+impl HaystackProducer for RawScanProducer {
+    fn name(&self) -> &'static str {
+        "RawScan"
+    }
+
+    fn produce<'ctx>(
+        &self,
+        context: &'ctx ProducerContext<'ctx>,
+        consumer: &mut dyn FnMut(ScanTarget<'_>),
+    ) {
+        let mut previous_raw_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
+
+        for &RawMatch { rule_id, start_idx, end_idx } in context.raw_matches.iter().rev() {
+            let rule_id_usize: usize = rule_id as usize;
+            let start_idx_usize = start_idx as usize;
+            let end_idx_usize = end_idx as usize;
+
+            // 在生产者内部进行 Vectorscan 级别的去重
+            let current_span = OffsetSpan::from_range(start_idx_usize..end_idx_usize);
+            if !record_match(&mut previous_raw_matches, rule_id_usize, current_span) {
+                continue;
+            }
+
+            // ★ 零拷贝 ★：'data' 是 'context.blob' 的一个切片
+            consumer(ScanTarget::SpecificRule {
+                haystack: Haystack {
+                    data: &context.blob.bytes()[start_idx_usize..end_idx_usize],
+                    start_offset_in_blob: start_idx_usize,
+                    is_base64: false,
+                },
+                rule_id_usize,
+            });
+        }
+    }
+}
+
+// --- 生产者 B: TreeSitterProducer ---
+struct TreeSitterProducer;
+impl HaystackProducer for TreeSitterProducer {
+    fn name(&self) -> &'static str {
+        "TreeSitter"
+    }
+
+    fn produce<'ctx>(
+        &self,
+        context: &'ctx ProducerContext<'ctx>,
+        consumer: &mut dyn FnMut(ScanTarget<'_>),
+    ) {
+        // ★ 修正 #1：使用 'context.tree_sitter_results' ★
+        if let Some(ref ts_results) = context.tree_sitter_results {
+            // ★ 修正 #1：迭代 'parser::MatchResult' ★
+            for match_result in ts_results.iter() {
+                if match_result.is_base64_decoded {
+                    // ★ 零拷贝 ★：'data' 借用了 'match_result.text' (一个 String)
+                    consumer(ScanTarget::AllRules(Haystack {
+                        data: match_result.text.as_bytes(),
+                        start_offset_in_blob: match_result.range.start,
+                        is_base64: true,
+                    }));
+                }
+            }
+        }
+    }
+}
+
+// --- 生产者 C: Base64Producer ---
+struct Base64Producer {
+    no_base64: bool, // 允许此生产者根据配置跳过
+}
+impl HaystackProducer for Base64Producer {
+    fn name(&self) -> &'static str {
+        "StandaloneBase64"
+    }
+
+    fn produce<'ctx>(
+        &self,
+        context: &'ctx ProducerContext<'ctx>,
+        consumer: &mut dyn FnMut(ScanTarget<'_>),
+    ) {
+        // 根据配置或 Blob 大小跳过
+        if self.no_base64 || context.blob.len() > BASE64_SCAN_LIMIT {
+            return;
+        }
+
+        const MAX_B64_DEPTH: usize = 2;
+        let b64_items = get_base64_strings(context.blob.bytes());
+        let mut b64_stack: Vec<(DecodedData, usize)> =
+            b64_items.into_iter().map(|d| (d, 0)).collect();
+
+        while let Some((item, depth)) = b64_stack.pop() {
+            // ★ 零拷贝 ★：'data' 借用了 'item.decoded' (一个 String)
+            let haystack_slice = item.decoded.as_bytes();
+            consumer(ScanTarget::AllRules(Haystack {
+                data: haystack_slice,
+                start_offset_in_blob: item.pos_start,
+                is_base64: true,
+            }));
+
+            // 处理嵌套的 Base64
+            if depth + 1 < MAX_B64_DEPTH {
+                for nested in get_base64_strings(haystack_slice) {
+                    b64_stack.push((
+                        DecodedData {
+                            original: nested.original,
+                            decoded: nested.decoded,
+                            pos_start: item.pos_start, // 偏移量保持为父级的
+                            pos_end: item.pos_end,
+                        },
+                        depth + 1,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// REFACTOR: 过滤管道 (Filtering Pipeline) 定义
 // -------------------------------------------------------------------------------------------------
 
 /// 一个临时的、零拷贝的匹配候选者，用于在过滤管道中高效传递。
@@ -266,6 +437,7 @@ type ZeroCopyFilterFn =
 /// `RulesDatabase`.
 ///
 /// If doing multi-threaded scanning, use a separate `Matcher` for each thread.
+/// ★ 修正 #2：'Matcher' 仍然是 'Clone' 的 ★
 #[derive(Clone)]
 pub struct Matcher<'a> {
     /// Thread-local pool that hands out a &mut BlockScanner
@@ -292,6 +464,10 @@ pub struct Matcher<'a> {
 
     /// Configuration that controls inline ignore directives
     inline_ignore_config: InlineIgnoreConfig,
+
+    /// REFACTOR: 可插拔的、零拷贝的生产者列表
+    /// ★ 修正 #2：使用 'Arc' 使 'producers' 字段可 'Clone' ★
+    producers: Arc<Vec<Box<dyn HaystackProducer>>>,
 }
 impl<'a> Matcher<'a> {
     pub fn get_profiling_report(&self) -> Option<Vec<RuleStats>> {
@@ -326,6 +502,9 @@ impl<'a> Matcher<'a> {
         shared_profiler: Option<Arc<ConcurrentRuleProfiler>>,
         extra_ignore_directives: &[String],
         disable_inline_ignores: bool,
+        // REFACTOR: 允许在创建 Matcher 时配置生产者
+        // （这里我们暂时硬编码，但未来可以传入一个 `Vec<Box<dyn HaystackProducer>>`）
+        no_base64: bool, // 传入 no_base64 来配置 Base64Producer
     ) -> Result<Self> {
         // Changed: removed `with_capacity(16384)` so we don't pre-allocate a large Vec
         let raw_matches_scratch = Vec::new();
@@ -339,6 +518,17 @@ impl<'a> Matcher<'a> {
                 None
             }
         });
+
+        // REFACTOR: 初始化生产者列表
+        // ★ 修正 #2：将生产者 'Vec' 包装在 'Arc' 中 ★
+        let producers: Arc<Vec<Box<dyn HaystackProducer>>> = Arc::new(vec![
+            Box::new(RawScanProducer),
+            Box::new(TreeSitterProducer),
+            Box::new(Base64Producer { no_base64 }),
+            // ★ 添加新的生产者 D 就像这样简单：
+            // Box::new(MyNewProducerD),
+        ]);
+
         Ok(Matcher {
             scanner_pool,
             rules_db,
@@ -352,9 +542,11 @@ impl<'a> Matcher<'a> {
             } else {
                 InlineIgnoreConfig::new(extra_ignore_directives)
             },
+            producers, // 添加生产者列表
         })
     }
 
+    /// 运行 Vectorscan 来填充 `self.user_data.raw_matches_scratch`
     fn scan_bytes_raw(&mut self, input: &[u8], _filename: &str) -> Result<()> {
         // Remember previous peak automatically
         let prev_capacity = self.user_data.raw_matches_scratch.capacity();
@@ -389,7 +581,7 @@ impl<'a> Matcher<'a> {
     }
 
     // -------------------------------------------------------------------------------------
-    // REFACTOR: `scan_blob` 签名不再有 'b 生命周期
+    // REFACTOR: `scan_blob` 现在是“协调者”
     // -------------------------------------------------------------------------------------
     pub fn scan_blob(
         &mut self,
@@ -398,15 +590,15 @@ impl<'a> Matcher<'a> {
         lang: Option<String>,
         redact: bool,
         no_dedup: bool,
-        no_base64: bool,
+        no_base64: bool, // 这个参数现在只用于 tree-sitter 检查
     ) -> Result<ScanResult> {
-        // Update local stats
+        // 更新本地统计
         self.local_stats.blobs_seen += 1;
         self.local_stats.bytes_seen += blob.bytes().len() as u64;
         self.local_stats.blobs_scanned += 1;
         self.local_stats.bytes_scanned += blob.bytes().len() as u64;
 
-        // Extract filename from origin
+        // 从 origin 提取文件名
         let filename = origin
             .first()
             .blob_path()
@@ -414,36 +606,26 @@ impl<'a> Matcher<'a> {
             .and_then(|name| name.to_str())
             .unwrap_or("unknown_file")
             .to_string();
-        // Perform the scan
+
+        // ====================================================================================
+        // 阶段 1: 准备生产者上下文 (Preparation)
+        // ====================================================================================
+
+        // 1a. 运行 Vectorscan (为 RawScanProducer 准备数据)
+        // 这会填充 `self.user_data.raw_matches_scratch`
         self.scan_bytes_raw(blob.bytes(), &filename)?;
-
-        // Opportunistically look for standalone Base64 blobs. If neither
-        // the raw scan nor this check yields anything, we can return early
-        // before doing any heavier work.
-        let mut b64_items = if no_base64 || blob.len() > BASE64_SCAN_LIMIT {
-            Vec::new()
-        } else {
-            get_base64_strings(blob.bytes())
-        };
-
-        let lang_hint = lang.as_deref();
         let has_raw_matches = !self.user_data.raw_matches_scratch.is_empty();
-        let has_base64_items = !b64_items.is_empty();
 
-        if !has_raw_matches && !has_base64_items {
-            return Ok(ScanResult::New(Vec::new()));
-        }
-
-        let rules_db = self.rules_db;
-
+        // 1b. 运行 Tree-Sitter (为 TreeSitterProducer 准备数据)
+        let lang_hint = lang.as_deref();
         let blob_len = blob.len();
-
         let should_run_tree_sitter = blob_len > 0
             && (TREE_SITTER_MIN_LIMIT..=TREE_SITTER_MAX_LIMIT).contains(&blob_len)
             && has_raw_matches
             && lang_hint.is_some()
             && !no_base64; //tree-sitter parsing is turned off when base64 scanning is disabled
 
+        // ★ 修正 #1：'tree_sitter_result' 现在是 'Option<Vec<parser::MatchResult>>' ★
         let tree_sitter_result = if should_run_tree_sitter {
             lang_hint.and_then(|lang_str| {
                 get_language_and_queries(lang_str).and_then(|(language, queries)| {
@@ -460,29 +642,21 @@ impl<'a> Matcher<'a> {
         } else {
             None
         };
-        // Process matches
-        let owned_ts_results = tree_sitter_result.map(|ts_results| {
-            ts_results
-                .into_iter()
-                .filter(|match_result| match_result.is_base64_decoded)
-                .map(|match_result| {
-                    (
-                        match_result.range,
-                        match_result.text,
-                        match_result.is_base64_decoded,
-                        match_result.original_base64,
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+        // (Base64Producer 不需要预先准备，它会在 'produce' 内部自己运行)
+
+        // 1c. 创建生产者上下文
+        // ★ 修正 #3：'producer_context' 借用了 'scan_blob' 栈上的变量 ★
+        let producer_context = ProducerContext {
+            blob,
+            filename: &filename,
+            lang_hint: &lang,
+            raw_matches: &self.user_data.raw_matches_scratch,
+            tree_sitter_results: &tree_sitter_result, // ★ 修正 #1
+        };
 
         // ====================================================================================
-        // 阶段2: 过滤
+        // 阶段 2: 准备过滤器和消费者 (Filter & Consumer Setup)
         // ====================================================================================
-
-        // -------------------------------------------------------------------------------------
-        // REFACTOR: 1. 设置管道
-        // -------------------------------------------------------------------------------------
 
         // 最终的 `BlobMatch` 列表
         let mut final_matches: Vec<BlobMatch> = Vec::new();
@@ -490,82 +664,64 @@ impl<'a> Matcher<'a> {
         // 为所有过滤器设置可变状态
         let mut seen_matches = FxHashSet::default();
         let mut previous_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
-        let mut previous_raw_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
 
-        // ★ blob_bytes 借用了 blob，生命周期为 'local_blob
-        let blob_bytes = blob.bytes();
-
-        // 创建一次性的上下文
+        // 创建一次性的过滤上下文
         let mut filter_context = FilterContext {
-            blob_bytes,
+            blob_bytes: blob.bytes(),
             inline_ignore_config: &self.inline_ignore_config,
             seen_matches: &mut seen_matches,
             previous_matches: &mut previous_matches,
         };
 
         // ★ 这就是你的可组合管道！★
-        // `ZeroCopyFilterFn` (使用 for<...>) 允许我们存储这些函数
         let filters: Vec<ZeroCopyFilterFn> = vec![
             Box::new(filter_entropy_and_safelist), // 阶段 1
             Box::new(filter_inline_ignore),        // 阶段 2 (零拷贝)
             Box::new(filter_overlap_dedup),        // 阶段 2 (零拷贝)
             Box::new(filter_hash_dedup),           // 阶段 2 (零拷贝, 内容感知)
-                                                   // ★ 要添加新功能，只需： Box::new(my_new_filter_function), ★
         ];
 
-        // -------------------------------------------------------------------------------------
-        // REFACTOR: 2. 执行管道
-        // -------------------------------------------------------------------------------------
+        // ====================================================================================
+        // 阶段 3: 生产与消费 (Production & Consumption)
+        // ====================================================================================
 
-        // --- 2a. 处理 Vectorscan (Raw) 匹配 ---
-        for &RawMatch { rule_id, start_idx, end_idx } in
-            self.user_data.raw_matches_scratch.iter().rev()
-        {
-            let rule_id_usize: usize = rule_id as usize;
-            let rule = Arc::clone(&rules_db.rules[rule_id_usize]);
-            let re = &rules_db.anchored_regexes[rule_id_usize];
-            let start_idx_usize = start_idx as usize;
-            let end_idx_usize = end_idx as usize;
-            let current_span = OffsetSpan::from_range(start_idx_usize..end_idx_usize);
-            if !record_match(&mut previous_raw_matches, rule_id_usize, current_span) {
-                continue;
-            }
+        // ★ 定义一个“消费者”闭包 ★
+        // 它捕获了运行管道所需的所有状态。
+        let mut consumer_closure = |target: ScanTarget<'_>| {
+            match target {
+                ScanTarget::SpecificRule { haystack, rule_id_usize } => {
+                    let rule = Arc::clone(&self.rules_db.rules[rule_id_usize]);
+                    let re = &self.rules_db.anchored_regexes[rule_id_usize];
 
-            // ★ haystack 借用了 'local_blob 生命周期
-            let haystack = &blob_bytes[start_idx_usize..end_idx_usize];
-            process_captures_pipeline(
-                blob.id(),
-                rule,
-                re,
-                rule_id_usize,
-                redact,
-                haystack,
-                start_idx_usize,
-                false, // is_base64
-                &filename,
-                self.profiler.as_ref(),
-                &mut final_matches,
-                &mut filter_context,
-                &filters,
-            );
-        }
+                    process_captures_pipeline(
+                        blob.id(),
+                        rule,
+                        re,
+                        rule_id_usize,
+                        redact,
+                        haystack.data, // ★ 零拷贝切片
+                        haystack.start_offset_in_blob,
+                        haystack.is_base64,
+                        &filename,
+                        self.profiler.as_ref(),
+                        &mut final_matches,
+                        &mut filter_context,
+                        &filters,
+                    );
+                }
+                ScanTarget::AllRules(haystack) => {
+                    for (rule_id_usize, rule) in self.rules_db.rules.iter().enumerate() {
+                        let re = &self.rules_db.anchored_regexes[rule_id_usize];
 
-        // --- 2b. 处理 Tree-Sitter 解码的匹配 ---
-        // ★ owned_ts_results 拥有数据, 'haystack 将借用它
-        if let Some(ref ts_results) = owned_ts_results {
-            for (ts_range, ts_match, is_base64_decoded, _original_base64) in ts_results.iter() {
-                if *is_base64_decoded {
-                    for (rule_id_usize, rule) in rules_db.rules.iter().enumerate() {
-                        let re = &rules_db.anchored_regexes[rule_id_usize];
                         process_captures_pipeline(
                             blob.id(),
                             rule.clone(),
                             re,
                             rule_id_usize,
                             redact,
-                            ts_match.as_bytes(), // 'haystack 借用 ts_match
-                            ts_range.start,
-                            true, // is_base64
+                            haystack.data, // ★ 零拷贝切片
+                            haystack.start_offset_in_blob,
+                            haystack.is_base64,
                             &filename,
                             self.profiler.as_ref(),
                             &mut final_matches,
@@ -575,52 +731,17 @@ impl<'a> Matcher<'a> {
                     }
                 }
             }
+        };
+
+        // ★ 运行所有生产者 ★
+        // ★ 修正 #2：迭代 'self.producers.iter()' ★
+        for producer in self.producers.iter() {
+            producer.produce(&producer_context, &mut consumer_closure);
         }
 
-        // --- 2c. 处理独立 Base64 解码的匹配 ---
-        // ★ b64_stack 拥有数据, 'haystack 将借用它
-        if !no_base64 {
-            const MAX_B64_DEPTH: usize = 2;
-            let mut b64_stack: Vec<(DecodedData, usize)> =
-                b64_items.drain(..).map(|d| (d, 0)).collect();
-            while let Some((item, depth)) = b64_stack.pop() {
-                for (rule_id_usize, rule) in rules_db.rules.iter().enumerate() {
-                    let re = &rules_db.anchored_regexes[rule_id_usize];
-                    process_captures_pipeline(
-                        blob.id(),
-                        rule.clone(),
-                        re,
-                        rule_id_usize,
-                        redact,
-                        item.decoded.as_bytes(), // 'haystack 借用 item.decoded
-                        item.pos_start,
-                        true, // is_base64
-                        &filename,
-                        self.profiler.as_ref(),
-                        &mut final_matches,
-                        &mut filter_context,
-                        &filters,
-                    );
-                }
-                if depth + 1 < MAX_B64_DEPTH {
-                    for nested in get_base64_strings(item.decoded.as_bytes()) {
-                        b64_stack.push((
-                            DecodedData {
-                                original: nested.original,
-                                decoded: nested.decoded,
-                                pos_start: item.pos_start,
-                                pos_end: item.pos_end,
-                            },
-                            depth + 1,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // -------------------------------------------------------------------------------------
-        // REFACTOR: 3. 返回最终结果
-        // -------------------------------------------------------------------------------------
+        // ====================================================================================
+        // 阶段 4: 清理 (Finalize)
+        // ====================================================================================
 
         // Finalize
         if !no_dedup && !final_matches.is_empty() {
@@ -1248,6 +1369,7 @@ mod test {
                 None,
                 &[],
                 false,
+                false
             )
             .unwrap();
 
@@ -1321,6 +1443,7 @@ mod test {
             enable_rule_profiling,
             None, // Pass the shared profiler
             &[],
+            false,
             false,
         )?;
         matcher.scan_bytes_raw(input.as_bytes(), "fname")?;
@@ -1409,7 +1532,8 @@ mod test {
         let rules_db = RulesDatabase::from_rules(vec![rule])?;
         let seen = BlobIdMap::new();
         let scanner_pool = Arc::new(ScannerPool::new(Arc::new(rules_db.vsdb.clone())));
-        let mut m = Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false)?;
+        let mut m =
+            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false, false)?;
 
         let buf = b"dup dup"; // two literal hits, same rule
 
@@ -1446,7 +1570,7 @@ mod test {
         let seen = BlobIdMap::new();
         let scanner_pool = Arc::new(ScannerPool::new(Arc::new(rules_db.vsdb.clone())));
         let mut matcher =
-            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false)?;
+            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false, false)?;
 
         let blob = Blob::from_bytes(b"let key = \"secret_token\" # kingfisher:ignore".to_vec());
         let origin = OriginSet::from(Origin::from_file(PathBuf::from("inline.txt")));
@@ -1478,7 +1602,7 @@ mod test {
         let seen = BlobIdMap::new();
         let scanner_pool = Arc::new(ScannerPool::new(Arc::new(rules_db.vsdb.clone())));
         let mut matcher =
-            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false)?;
+            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false, false)?;
 
         let blob = Blob::from_bytes(
             br#"let data = """
@@ -1522,7 +1646,7 @@ line2
         let seen = BlobIdMap::new();
         let scanner_pool = Arc::new(ScannerPool::new(Arc::new(rules_db.vsdb.clone())));
         let mut matcher =
-            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false)?;
+            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &[], false, false)?;
         let matches_without_compat =
             match matcher.scan_blob(&blob, &origin, None, false, false, false)? {
                 ScanResult::New(matches) => matches.len(),
@@ -1534,7 +1658,7 @@ line2
         let scanner_pool = Arc::new(ScannerPool::new(Arc::new(rules_db.vsdb.clone())));
         let extra = vec![String::from("gitleaks:allow")];
         let mut matcher =
-            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &extra, false)?;
+            Matcher::new(&rules_db, scanner_pool, &seen, None, false, None, &extra, false, false)?;
         match matcher.scan_blob(&blob, &origin, None, false, false, false)? {
             ScanResult::New(matches) => assert!(matches.is_empty()),
             _ => panic!("unexpected scan result"),

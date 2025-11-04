@@ -683,6 +683,7 @@ pub async fn fetch_s3_objects(
         Some(shared_profiler.clone()),
         &args.extra_ignore_comments,
         args.no_inline_ignore,
+        args.no_base64,
     )?;
     let mut processor = BlobProcessor { matcher };
 
@@ -764,6 +765,7 @@ pub async fn fetch_gcs_objects(
         Some(shared_profiler.clone()),
         &args.extra_ignore_comments,
         args.no_inline_ignore,
+        args.no_base64,
     )?;
     let mut processor = BlobProcessor { matcher };
 
