@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    blob::BlobMetadata, findings_store, matcher::Match, origin::OriginSet, rules::rule::Confidence,
+    blob::BlobMetadata, findings_store, matcher::match_structs::Match, origin::OriginSet, rules::rule::Confidence,
 };
 // -------------------------------------------------------------------------------------------------
 // FindingData

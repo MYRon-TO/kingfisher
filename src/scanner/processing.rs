@@ -6,7 +6,7 @@ use crate::{
     blob::{Blob, BlobMetadata},
     content_type::ContentInspector,
     location::LocationMapping,
-    matcher::{Match, Matcher, OwnedBlobMatch, ScanResult},
+    matcher::{match_structs::{Match, OwnedBlobMatch}, Matcher, ScanResult},
     origin::{Origin, OriginSet},
     scanner::repos::DatastoreMessage,
     Path,

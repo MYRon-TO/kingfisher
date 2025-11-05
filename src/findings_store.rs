@@ -15,7 +15,7 @@ use crate::{
     finding_data,
     git_url::GitUrl,
     location::OffsetSpan,
-    matcher::Match,
+    matcher::match_structs::Match,
     origin::{Origin, OriginSet},
     rules::rule::Rule,
     util::intern,

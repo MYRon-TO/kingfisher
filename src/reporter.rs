@@ -16,7 +16,7 @@ use crate::{
     cli,
     cli::global::GlobalArgs,
     finding_data, findings_store,
-    matcher::Match,
+    matcher::match_structs::Match,
     origin::{Origin, OriginSet},
     rules::rule::Confidence,
 };
