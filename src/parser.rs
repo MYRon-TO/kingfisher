@@ -49,6 +49,7 @@ pub enum Language {
     Toml,
     TypeScript,
     Yaml,
+    // Perl,
 }
 #[derive(Debug, Clone)]
 pub struct MatchResult {
@@ -77,6 +78,7 @@ impl Language {
             Language::Toml => "toml",
             Language::TypeScript => "typescript",
             Language::Yaml => "yaml",
+            // Language::Perl => "perl",
         }
     }
 
@@ -99,6 +101,7 @@ impl Language {
             Language::Toml => Ok(tree_sitter_toml_ng::LANGUAGE.into()),
             Language::TypeScript => Ok(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Language::Yaml => Ok(tree_sitter_yaml::LANGUAGE.into()),
+            // Language::Perl => Ok(tree_sitter_perl::LANGUAGE.into()),
         }
     }
 }
@@ -108,7 +111,7 @@ impl FromStr for Language {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "bash" => Ok(Language::Bash),
+            "bash" | "zsh" | "shell" => Ok(Language::Bash),
             "c" => Ok(Language::C),
             "csharp" | "c_sharp" => Ok(Language::CSharp),
             "cpp" => Ok(Language::Cpp),

@@ -6,7 +6,10 @@ use crate::{
     blob::{Blob, BlobMetadata},
     content_type::ContentInspector,
     location::LocationMapping,
-    matcher::{match_structs::{Match, OwnedBlobMatch}, Matcher, ScanResult},
+    matcher::{
+        match_structs::{Match, OwnedBlobMatch},
+        Matcher, ScanResult,
+    },
     origin::{Origin, OriginSet},
     scanner::repos::DatastoreMessage,
     Path,
@@ -35,6 +38,11 @@ impl<'a> BlobProcessor<'a> {
             .iter()
             .find_map(|p| p.blob_path())
             .and_then(|path| ContentInspector::default().guess_language(path, blob.bytes()));
+
+        // if let Some(l) = language_hint.as_deref() {
+        //     println!("{l}")
+        // }
+
         let res =
             self.matcher.scan_blob(&blob, &origin, language_hint, redact, no_dedup, no_base64)?;
         let scan_us = t1.elapsed().as_micros();

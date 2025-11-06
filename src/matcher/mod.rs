@@ -3,6 +3,7 @@ pub mod filter;
 pub mod match_structs;
 pub mod producer;
 pub mod stats;
+pub mod suspicious_name;
 pub mod util;
 
 pub use self::captures::SerializableCaptures;
@@ -15,6 +16,7 @@ use anyhow::Result;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::matcher::producer::ASTProducer;
 use crate::{
     blob::{Blob, BlobIdMap},
     inline_ignore::InlineIgnoreConfig,
@@ -149,6 +151,7 @@ impl<'a> Matcher<'a> {
             Box::new(RawScanProducer),
             Box::new(TreeSitterProducer),
             Box::new(Base64Producer { no_base64 }),
+            Box::new(ASTProducer),
             // ★ 添加新的生产者 D 就像这样简单：
             // Box::new(MyNewProducerD),
         ]);
@@ -899,7 +902,7 @@ secret_a="$secret_b"
 secret_b="$secret_a"
 "#;
 
-        let produced_haystacks = run_ast_producer_on_code(test_code, "bash", "test.sh");
+        let produced_haystacks = run_ast_producer_on_code(test_code, "zsh", "test.sh");
 
         // 5. 断言 (Assert)
 
@@ -924,6 +927,203 @@ secret_b="$secret_a"
             "sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh".to_string(),
             "未找到 secret_key_3 (重定向 + 拼接)"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ast_producer_go_construct() -> Result<()> {
+        // 1. 准备测试代码 (Blob)
+        // 包含多种情况：
+        // - secret_key_1: 简单的 + 拼接
+        // - secret_key_2: f-string 拼接
+        // - secret_key_3: 变量重定向 (a -> b -> c)
+        // - ignored_1:      命名不可疑
+        // - ignored_2:      构造了但熵太低
+        // - ignored_3:      循环依赖
+        let test_code = r#"
+package main
+
+var (
+    part_a = "sk_live_0000000000000000"
+    part_b = "aBcDeFgHiJkL_mNoPqR_sTuV"
+    part_c = "wXyZ_1234567890_abcdefgh"
+)
+
+var secret_key_1 = part_a + part_b
+
+var secret_key_2 = "prefix_" + part_c + "_suffix"
+
+var real_key = part_a
+var key_alias = real_key
+var secret_key_3 = key_alias + "_plus_" + part_c
+
+var normal_var = part_a + part_b + part_c
+
+var secret_key_low = "hello" + "world"
+
+var secret_b = ""
+var secret_a = secret_b
+
+var secret_key_4 = fmt.Sprintf("%s_plus_%s-4", key_alias, part_c)
+"#;
+
+        let produced_haystacks = run_ast_producer_on_code(test_code, "go", "test.go");
+
+        // 5. 断言 (Assert)
+
+        // println!("{:?}", produced_haystacks);
+
+        // 我们应该只找到 3 个构造出的密钥
+        assert_eq!(produced_haystacks.len(), 4, "应该只找到4个高可信度的构造密钥");
+
+        // 检查 3 个密钥是否都按预期构造出来了
+        assert_eq!(
+            produced_haystacks[0].0,
+            "sk_live_0000000000000000aBcDeFgHiJkL_mNoPqR_sTuV".to_string(),
+            "未找到 secret_key_1 (a + b)"
+        );
+        assert_eq!(
+            produced_haystacks[1].0,
+            "prefix_wXyZ_1234567890_abcdefgh_suffix".to_string(),
+            "未找到 secret_key_2 (f-string)"
+        );
+        assert_eq!(
+            produced_haystacks[2].0,
+            "sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh".to_string(),
+            "未找到 secret_key_3 (重定向 + 拼接)"
+        );
+
+        assert_eq!(
+            produced_haystacks[3].0,
+            "sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh-4".to_string(),
+            "未找到 secret_key_4 (重定向 + 拼接)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ast_producer_java_construct() -> Result<()> {
+        // 1. 准备测试代码 (Blob)
+        // 包含多种情况：
+        // - secret_key_1: 简单的 + 拼接
+        // - secret_key_2: f-string 拼接
+        // - secret_key_3: 变量重定向 (a -> b -> c)
+        // - ignored_1:      命名不可疑
+        // - ignored_2:      构造了但熵太低
+        // - ignored_3:      循环依赖
+        let test_code = r#"
+String part_a = "sk_live_0000000000000000";
+String part_b = "aBcDeFgHiJkL_mNoPqR_sTuV";
+String part_c = "wXyZ_1234567890_abcdefgh";
+
+String secret_key_1 = part_a + part_b;
+
+String secret_key_2 = "prefix_" + part_c + "_suffix";
+
+String real_key = part_a;
+String key_alias = real_key;
+String secret_key_3 = key_alias + "_plus_" + part_c;
+
+String normal_var = part_a + part_b + part_c;
+
+String secret_key_low = "hello" + "world";
+
+String secret_b = "";
+String secret_a = secret_b;
+secret_b = secret_a;
+"#;
+
+        let produced_haystacks = run_ast_producer_on_code(test_code, "java", "test.java");
+
+        // 5. 断言 (Assert)
+
+        // println!("{:?}", produced_haystacks);
+
+        // 我们应该只找到 3 个构造出的密钥
+        assert_eq!(produced_haystacks.len(), 3, "应该只找到3个高可信度的构造密钥");
+
+        // 检查 3 个密钥是否都按预期构造出来了
+        assert_eq!(
+            produced_haystacks[0].0,
+            "sk_live_0000000000000000aBcDeFgHiJkL_mNoPqR_sTuV".to_string(),
+            "未找到 secret_key_1 (a + b)"
+        );
+        assert_eq!(
+            produced_haystacks[1].0,
+            "prefix_wXyZ_1234567890_abcdefgh_suffix".to_string(),
+            "未找到 secret_key_2 (f-string)"
+        );
+        assert_eq!(
+            produced_haystacks[2].0,
+            "sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh".to_string(),
+            "未找到 secret_key_3 (重定向 + 拼接)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ast_producer_php_construct() -> Result<()> {
+        let test_code = r#"
+<?php
+$part_a = "sk_live_0000000000000000";
+$part_b = "aBcDeFgHiJkL_mNoPqR_sTuV";
+$part_c = "wXyZ_1234567890_abcdefgh";
+
+$secret_key_1 = $part_a . $part_b;
+
+$secret_key_2 = "prefix_{$part_c}_suffix"; // ★ 你的插值字符串
+
+$real_key = $part_a;
+$key_alias = $real_key;
+$secret_key_3 = $key_alias . "_plus_" . $part_c;
+
+$normal_var = $part_a . $part_b . $part_c;
+$secret_key_low = "hello" . "world";
+$secret_b = "";
+$secret_a = $secret_b;
+$secret_b = $secret_a;
+?>
+"#;
+
+        let produced_haystacks = run_ast_producer_on_code(test_code, "php", "test.php");
+
+        // 5. 断言 (Assert)
+
+        // println!("{:#?}", produced_haystacks);
+
+        assert_eq!(produced_haystacks.len(), 3, "应该只找到3个高可信度的构造密钥");
+
+        // --- ★ 修正：使用 HashMap 来进行顺序无关的检查 ---
+
+        let mut results_map = FxHashMap::default();
+        for (value, offset) in produced_haystacks {
+            results_map.insert(offset, value);
+        }
+
+        // 检查 secret_key_1
+        let offset1 = test_code.find("$secret_key_1").unwrap();
+        assert_eq!(
+            results_map.get(&offset1),
+            Some(&"sk_live_0000000000000000aBcDeFgHiJkL_mNoPqR_sTuV".to_string()),
+            "未找到 secret_key_1 (. 拼接)"
+        );
+
+        // 检查 secret_key_2
+        let offset2 = test_code.find("$secret_key_2").unwrap();
+        assert_eq!(
+            results_map.get(&offset2),
+            Some(&"prefix_wXyZ_1234567890_abcdefgh_suffix".to_string()),
+            "未找到 secret_key_2 (插值字符串)"
+        );
+
+        // 检查 secret_key_3
+        let offset3 = test_code.find("$secret_key_3").unwrap();
+        assert_eq!(
+            results_map.get(&offset3),
+            Some(&"sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh".to_string()),
+            "未找到 secret_key_3 (重定向 + 拼接)"
+        );
+
         Ok(())
     }
 }

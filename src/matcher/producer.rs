@@ -8,6 +8,7 @@ use crate::entropy::calculate_shannon_entropy;
 use crate::matcher::producer::ast::{
     get_ast_language_pack, parse_expression_recursive, resolve_value, SymbolInfo,
 };
+use crate::matcher::suspicious_name::is_suspicious_var_name;
 use crate::parser::Language;
 use crate::{blob::Blob, location::OffsetSpan, parser};
 
@@ -43,7 +44,11 @@ pub enum ScanTarget<'a> {
     AllRules(Haystack<'a>),
     /// 仅针对此 haystack 运行 *特定规则*。
     /// (主要用于 Vectorscan 的 RawMatch)
-    SpecificRule { haystack: Haystack<'a>, rule_id_usize: usize },
+    SpecificRule {
+        haystack: Haystack<'a>,
+        rule_id_usize: usize,
+    },
+    // NoRule(Haystack<'a>),
 }
 
 /// 传递给每个生产者的只读上下文。
@@ -287,28 +292,13 @@ impl HaystackProducer for ASTProducer {
                 if let Some(resolved_string) =
                     resolve_value(&symbol.value, &symbol_table, &mut visited)
                 {
-                    if resolved_string.len() > 10
-                        && calculate_shannon_entropy(resolved_string.as_bytes()) > 3.0
-                    {
-                        consumer(ScanTarget::AllRules(Haystack {
-                            data: resolved_string.as_bytes(),
-                            start_offset_in_blob: symbol.defined_at_offset,
-                            is_base64: false,
-                        }));
-                    }
+                    consumer(ScanTarget::AllRules(Haystack {
+                        data: resolved_string.as_bytes(),
+                        start_offset_in_blob: symbol.defined_at_offset,
+                        is_base64: false,
+                    }));
                 }
             }
         }
     }
-}
-
-/// TODO: 辅助函数：实现你的“额外状态”推断
-fn is_suspicious_var_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    // 这是一个简单的启发式，可以扩展
-    lower.contains("key")
-        || lower.contains("secret")
-        || lower.contains("token")
-        || lower.contains("auth")
-        || lower.contains("pass")
 }

@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use http::StatusCode;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
     blob::BlobId,
     location::{Location, LocationMapping, OffsetSpan, SourcePoint, SourceSpan},
     rules::rule::Rule,
-    snippet::Base64BString,
 };
 
 use super::{captures::SerializableCaptures, util::compute_finding_fingerprint};
@@ -212,10 +211,7 @@ impl Match {
         Match {
             rule: owned_blob_match.rule.clone(),
             visible: owned_blob_match.rule.visible().to_owned(),
-            location: Location {
-                offset_span,
-                source_span: source_span.clone(),
-            },
+            location: Location { offset_span, source_span: source_span.clone() },
             groups: owned_blob_match.captures.clone(),
             blob_id: owned_blob_match.blob_id,
             finding_fingerprint,
