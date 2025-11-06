@@ -689,20 +689,10 @@ mod tests {
     use super::*;
     use crate::{
         blob::{BlobId, BlobMetadata},
-        cli::commands::inputs::{ContentFilteringArgs, InputSpecifierArgs},
-        cli::commands::output::OutputArgs,
-        cli::commands::scan::{ConfidenceLevel, ScanArgs},
-        cli::commands::{
-            azure::AzureRepoType,
-            bitbucket::{BitbucketAuthArgs, BitbucketRepoType},
-            gitea::GiteaRepoType,
-            github::{GitCloneMode, GitHistoryMode, GitHubRepoType},
-            gitlab::GitLabRepoType,
-            rules::RuleSpecifierArgs,
-        },
+        cli::commands::{azure::AzureRepoType, bitbucket::{BitbucketAuthArgs, BitbucketRepoType}, gitea::GiteaRepoType, github::{GitCloneMode, GitHistoryMode, GitHubRepoType}, gitlab::GitLabRepoType, inputs::{ContentFilteringArgs, InputSpecifierArgs}, output::OutputArgs, rules::RuleSpecifierArgs, scan::{ConfidenceLevel, ScanArgs}},
         git_commit_metadata::CommitMetadata,
         location::{Location, OffsetSpan, SourcePoint, SourceSpan},
-        matcher::{SerializableCapture, SerializableCaptures},
+        matcher::{SerializableCaptures, captures::SerializableCapture},
         origin::{Origin, OriginSet},
         rules::rule::{Confidence, Rule, RuleSyntax},
     };

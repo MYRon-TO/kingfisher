@@ -1,18 +1,24 @@
+use std::str::FromStr;
+use tree_sitter::StreamingIterator;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use tree_sitter::{Parser, Query, QueryCursor};
 
-use crate::{
-    blob::Blob,
-    location::OffsetSpan,
-    parser,
+use crate::entropy::calculate_shannon_entropy;
+use crate::matcher::producer::ast::{
+    get_ast_language_pack, parse_expression_recursive, resolve_value, SymbolInfo,
 };
+use crate::parser::Language;
+use crate::{blob::Blob, location::OffsetSpan, parser};
 
+use super::util::record_match;
 use super::{
     match_structs::RawMatch,
     util::{get_base64_strings, DecodedData},
     BASE64_SCAN_LIMIT,
 };
-use super::util::record_match;
+
+mod ast;
 
 // -------------------------------------------------------------------------------------------------
 // REFACTOR: 生产者 (Producer) 抽象
@@ -37,10 +43,7 @@ pub enum ScanTarget<'a> {
     AllRules(Haystack<'a>),
     /// 仅针对此 haystack 运行 *特定规则*。
     /// (主要用于 Vectorscan 的 RawMatch)
-    SpecificRule {
-        haystack: Haystack<'a>,
-        rule_id_usize: usize,
-    },
+    SpecificRule { haystack: Haystack<'a>, rule_id_usize: usize },
 }
 
 /// 传递给每个生产者的只读上下文。
@@ -84,12 +87,7 @@ impl HaystackProducer for RawScanProducer {
     ) {
         let mut previous_raw_matches: FxHashMap<usize, Vec<OffsetSpan>> = FxHashMap::default();
 
-        for &RawMatch {
-            rule_id,
-            start_idx,
-            end_idx,
-        } in context.raw_matches.iter().rev()
-        {
+        for &RawMatch { rule_id, start_idx, end_idx } in context.raw_matches.iter().rev() {
             let rule_id_usize: usize = rule_id as usize;
             let start_idx_usize = start_idx as usize;
             let end_idx_usize = end_idx as usize;
@@ -191,4 +189,126 @@ impl HaystackProducer for Base64Producer {
             }
         }
     }
+}
+
+// --- 生产者 D: ASTProducer ---
+pub(crate) struct ASTProducer;
+impl HaystackProducer for ASTProducer {
+    fn name(&self) -> &'static str {
+        "AST"
+    }
+
+    fn produce<'ctx>(
+        &self,
+        context: &'ctx ProducerContext<'ctx>,
+        consumer: &mut dyn FnMut(ScanTarget<'_>),
+    ) {
+        // 1. 确定语言
+        let Some(lang_str) = context.lang_hint.as_deref() else {
+            return;
+        };
+        let Ok(language_enum) = Language::from_str(lang_str) else {
+            return;
+        };
+
+        // --- ★ 逻辑顺序修复 ★ ---
+
+        // 2. ★ (原 步骤 3) 先获取 ts_language (借用 language_enum)
+        let Ok(ts_language) = language_enum.get_ts_language() else {
+            return;
+        };
+
+        // 3. ★ (原 步骤 2) 再获取“分析包” (移动 language_enum)
+        let Some(lang_pack) = get_ast_language_pack(language_enum) else {
+            // 此语言不支持 AST 构造分析
+            return;
+        };
+
+        // 4. 获取 AST 解析器
+        let mut ts_parser = Parser::new();
+        if ts_parser.set_language(&ts_language).is_err() {
+            return;
+        }
+
+        // ★ 关键: `tree` 必须在 `source_bytes` 之前声明
+        // 尽管 Rust 不强制，但这更清晰
+        let Some(tree) = ts_parser.parse(context.blob.bytes(), None) else { return };
+        let root_node = tree.root_node();
+        let source_bytes = context.blob.bytes();
+
+        // 5. 动态编译查询
+        let Ok(assign_query) = Query::new(&ts_language, lang_pack.assignment_query) else {
+            return; // 查询编译失败
+        };
+
+        // --- 阶段 1: 构建符号依赖图 (Symbol Table) ---
+
+        let mut symbol_table: FxHashMap<String, SymbolInfo> = FxHashMap::default();
+        let mut query_cursor = QueryCursor::new();
+
+        let mut matches_iterator = query_cursor.matches(&assign_query, root_node, source_bytes);
+
+        while let Some(m) = matches_iterator.next() {
+            let mut name_node = None;
+            let mut value_node = None;
+
+            for capture in m.captures {
+                let capture_name = assign_query.capture_names()[capture.index as usize];
+                if capture_name == "name" {
+                    name_node = Some(capture.node);
+                } else if capture_name == "value" {
+                    value_node = Some(capture.node);
+                }
+            }
+
+            if let (Some(name_node), Some(value_node)) = (name_node, value_node) {
+                if let Ok(name) = name_node.utf8_text(source_bytes) {
+                    // ★ 现在 `parse_expression_recursive` 的生命周期解耦了 ★
+                    // node(value_node) 的生命周期 ('tree) 和
+                    // source(source_bytes) 的生命周期 ('ctx)
+                    // 不再被强制要求相同。
+                    let value = parse_expression_recursive(value_node, source_bytes, &lang_pack);
+
+                    let info = SymbolInfo {
+                        name: name.to_string(),
+                        defined_at_offset: name_node.start_byte(),
+                        value,
+                    };
+                    symbol_table.insert(name.to_string(), info);
+                }
+            }
+        }
+
+        // --- 阶段 2: 使用图（启发式推断）---
+        // (此阶段完全不变)
+        for symbol in symbol_table.values() {
+            if is_suspicious_var_name(&symbol.name) {
+                let mut visited = FxHashSet::default();
+                if let Some(resolved_string) =
+                    resolve_value(&symbol.value, &symbol_table, &mut visited)
+                {
+                    if resolved_string.len() > 10
+                        && calculate_shannon_entropy(resolved_string.as_bytes()) > 3.0
+                    {
+                        consumer(ScanTarget::AllRules(Haystack {
+                            data: resolved_string.as_bytes(),
+                            start_offset_in_blob: symbol.defined_at_offset,
+                            is_base64: false,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// TODO: 辅助函数：实现你的“额外状态”推断
+fn is_suspicious_var_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    // 这是一个简单的启发式，可以扩展
+    lower.contains("key")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("auth")
+        || lower.contains("pass")
 }

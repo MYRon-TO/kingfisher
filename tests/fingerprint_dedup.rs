@@ -11,7 +11,7 @@ use kingfisher::{
     findings_store::FindingsStore,
     git_commit_metadata::CommitMetadata,
     location::{Location, OffsetSpan, SourcePoint, SourceSpan},
-    matcher::{Match, SerializableCapture, SerializableCaptures},
+    matcher::{captures::SerializableCapture, Match, SerializableCaptures},
     origin::{Origin, OriginSet},
     reporter::{styles::Styles, DetailsReporter, ReportMatch},
     rules::rule::{Confidence, Rule, RuleSyntax},

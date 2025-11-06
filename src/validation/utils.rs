@@ -120,7 +120,7 @@ pub async fn check_url_resolvable(url: &Url) -> Result<(), Box<dyn std::error::E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::{SerializableCapture, SerializableCaptures};
+    use crate::matcher::{captures::SerializableCapture, SerializableCaptures};
     use pretty_assertions::assert_eq;
     use smallvec::smallvec;
 

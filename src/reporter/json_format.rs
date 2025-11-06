@@ -34,7 +34,8 @@ mod tests {
     use crate::cli::commands::github::GitCloneMode;
     use crate::cli::commands::github::GitHistoryMode;
     use crate::cli::commands::rules::RuleSpecifierArgs;
-    use crate::matcher::{SerializableCapture, SerializableCaptures};
+    use crate::matcher::SerializableCaptures;
+    use crate::matcher::captures::SerializableCapture;
     use crate::rules::rule::{Confidence, Rule, RuleSyntax};
     use crate::util::intern;
     use crate::{

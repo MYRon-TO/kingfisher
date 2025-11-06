@@ -20,7 +20,7 @@ use crate::{
     inline_ignore::InlineIgnoreConfig,
     location::OffsetSpan,
     origin::OriginSet,
-    parser::{self, Checker},
+    parser::Checker,
     rule_profiling::{ConcurrentRuleProfiler, RuleStats},
     rules_database::RulesDatabase,
     scanner_pool::ScannerPool,
@@ -405,8 +405,9 @@ mod test {
 
     use super::*;
     use crate::matcher::match_structs::{BlobMatch, Match, OwnedBlobMatch, RawMatch};
+    use crate::matcher::producer::ASTProducer;
     use crate::rules::rule::Confidence;
-    use crate::rules::RulesDatabase;
+    // use crate::rules::RulesDatabase;
     use crate::scanner_pool::ScannerPool;
     use crate::{
         blob::{Blob, BlobIdMap},
@@ -760,5 +761,169 @@ line2
 
         Ok(())
     }
-}
 
+    // --- 辅助函数：用于运行 ASTProducer ---
+
+    /// 运行 ASTProducer 并返回所有被“生产”出的 Haystack (String, offset)
+    /// ★ 修正：接受 lang_str 和 filename
+    fn run_ast_producer_on_code(
+        code: &str,
+        lang_str: &str,
+        filename: &str,
+    ) -> Vec<(String, usize)> {
+        // 1. 创建 Blob
+        let blob = Blob::from_bytes(code.as_bytes().to_vec());
+
+        // 2. 创建模拟的 ProducerContext
+        // ★ 修正：使用传入的 lang_str
+        let lang = Some(lang_str.to_string());
+        let raw_matches = Vec::new(); // ASTProducer 不依赖 raw_matches
+        let context = ProducerContext {
+            blob: &blob,
+            // ★ 修正：使用传入的 filename
+            filename,
+            lang_hint: &lang,
+            raw_matches: &raw_matches,
+            tree_sitter_results: &None,
+        };
+
+        // 3. 创建捕获型 consumer
+        let mut consumed_haystacks: Vec<(String, usize)> = Vec::new();
+        let mut consumer = |target: ScanTarget<'_>| {
+            if let ScanTarget::AllRules(haystack) = target {
+                // 存储一个拥有的副本
+                consumed_haystacks.push((
+                    String::from_utf8_lossy(haystack.data).to_string(),
+                    haystack.start_offset_in_blob,
+                ));
+            }
+        };
+
+        // 4. 运行 Producer
+        let producer = ASTProducer;
+        producer.produce(&context, &mut consumer);
+
+        // 5. 返回结果
+        consumed_haystacks
+    }
+
+    #[test]
+    fn test_ast_producer_python_construct() -> Result<()> {
+        // 1. 准备测试代码 (Blob)
+        // 包含多种情况：
+        // - secret_key_1: 简单的 + 拼接
+        // - secret_key_2: f-string 拼接
+        // - secret_key_3: 变量重定向 (a -> b -> c)
+        // - ignored_1:      命名不可疑
+        // - ignored_2:      构造了但熵太低
+        // - ignored_3:      循环依赖
+        let test_code = r#"
+part_a = "sk_live_0000000000000000"
+part_b = "aBcDeFgHiJkL_mNoPqR_sTuV"
+part_c = "wXyZ_1234567890_abcdefgh"
+
+secret_key_1 = part_a + part_b
+
+secret_key_2 = f"prefix_{part_c}_suffix"
+
+real_key = part_a
+key_alias = real_key
+secret_key_3 = key_alias + "_plus_" + part_c
+
+normal_var = part_a + part_b + part_c
+
+secret_key_low = "hello" + "world"
+
+secret_a = secret_b
+secret_b = secret_a
+"#;
+
+        let produced_haystacks = run_ast_producer_on_code(test_code, "python", "test.py");
+
+        // 5. 断言 (Assert)
+
+        // println!("{:?}", produced_haystacks);
+
+        // 我们应该只找到 3 个构造出的密钥
+        assert_eq!(produced_haystacks.len(), 3, "应该只找到3个高可信度的构造密钥");
+
+        // 检查 3 个密钥是否都按预期构造出来了
+        assert_eq!(
+            produced_haystacks[0].0,
+            "sk_live_0000000000000000aBcDeFgHiJkL_mNoPqR_sTuV".to_string(),
+            "未找到 secret_key_1 (a + b)"
+        );
+        assert_eq!(
+            produced_haystacks[1].0,
+            "prefix_wXyZ_1234567890_abcdefgh_suffix".to_string(),
+            "未找到 secret_key_2 (f-string)"
+        );
+        assert_eq!(
+            produced_haystacks[2].0,
+            "sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh".to_string(),
+            "未找到 secret_key_3 (重定向 + 拼接)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_ast_producer_bash_construct() -> Result<()> {
+        // 1. 准备测试代码 (Blob)
+        // 包含多种情况：
+        // - secret_key_1: 简单的 + 拼接
+        // - secret_key_2: f-string 拼接
+        // - secret_key_3: 变量重定向 (a -> b -> c)
+        // - ignored_1:      命名不可疑
+        // - ignored_2:      构造了但熵太低
+        // - ignored_3:      循环依赖
+        let test_code = r#"
+#!/bin/bash
+
+part_a="sk_live_0000000000000000"
+part_b="aBcDeFgHiJkL_mNoPqR_sTuV"
+part_c="wXyZ_1234567890_abcdefgh"
+
+secret_key_1="${part_a}${part_b}"
+
+secret_key_2="prefix_${part_c}_suffix"
+
+real_key="$part_a"
+key_alias="$real_key"
+secret_key_3="${key_alias}_plus_${part_c}"
+
+normal_var="${part_a}${part_b}${part_c}"
+
+secret_key_low="helloworld"
+
+secret_a="$secret_b"
+secret_b="$secret_a"
+"#;
+
+        let produced_haystacks = run_ast_producer_on_code(test_code, "bash", "test.sh");
+
+        // 5. 断言 (Assert)
+
+        // println!("{:?}", produced_haystacks);
+
+        // 我们应该只找到 3 个构造出的密钥
+        assert_eq!(produced_haystacks.len(), 3, "应该只找到3个高可信度的构造密钥");
+
+        // 检查 3 个密钥是否都按预期构造出来了
+        assert_eq!(
+            produced_haystacks[0].0,
+            "sk_live_0000000000000000aBcDeFgHiJkL_mNoPqR_sTuV".to_string(),
+            "未找到 secret_key_1 (a + b)"
+        );
+        assert_eq!(
+            produced_haystacks[1].0,
+            "prefix_wXyZ_1234567890_abcdefgh_suffix".to_string(),
+            "未找到 secret_key_2 (f-string)"
+        );
+        assert_eq!(
+            produced_haystacks[2].0,
+            "sk_live_0000000000000000_plus_wXyZ_1234567890_abcdefgh".to_string(),
+            "未找到 secret_key_3 (重定向 + 拼接)"
+        );
+        Ok(())
+    }
+}

@@ -125,7 +125,7 @@ mod tests {
     use crate::{
         blob::{BlobId, BlobMetadata},
         location::{Location, OffsetSpan, SourcePoint, SourceSpan},
-        matcher::{Match, SerializableCapture, SerializableCaptures},
+        matcher::{Match, SerializableCaptures, captures::SerializableCapture},
         origin::{Origin, OriginSet},
         rules::rule::{Confidence, Rule, RuleSyntax},
     };
