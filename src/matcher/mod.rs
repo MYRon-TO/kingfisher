@@ -17,6 +17,7 @@ use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::matcher::producer::ASTProducer;
+use crate::rules::rule::{Rule, RuleSyntax};
 use crate::{
     blob::{Blob, BlobIdMap},
     inline_ignore::InlineIgnoreConfig,
@@ -312,11 +313,25 @@ impl<'a> Matcher<'a> {
         // 阶段 3: 生产与消费 (Production & Consumption)
         // ===================================================================================
 
+        let ast_rule_id_usize = self
+            .rules_db
+            .rules
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.id() == "ast.suspicious-variable") // <- 你的新规则 ID
+            .map(|(i, _)| i);
+
         // ★ 定义一个“消费者”闭包 ★
         // 它捕获了运行管道所需的所有状态。
         let mut consumer_closure = |target: ScanTarget<'_>| {
             match target {
                 ScanTarget::SpecificRule { haystack, rule_id_usize } => {
+                    if let Some(ast_rule_id) = ast_rule_id_usize {
+                        if rule_id_usize == ast_rule_id {
+                            return;
+                        }
+                    }
+
                     let rule = Arc::clone(&self.rules_db.rules[rule_id_usize]);
                     let re = &self.rules_db.anchored_regexes[rule_id_usize];
 
@@ -338,6 +353,12 @@ impl<'a> Matcher<'a> {
                 }
                 ScanTarget::AllRules(haystack) => {
                     for (rule_id_usize, rule) in self.rules_db.rules.iter().enumerate() {
+                        if let Some(ast_rule_id) = ast_rule_id_usize {
+                            if rule_id_usize == ast_rule_id {
+                                continue;
+                            }
+                        }
+
                         let re = &self.rules_db.anchored_regexes[rule_id_usize];
 
                         process_captures_pipeline(
@@ -356,6 +377,49 @@ impl<'a> Matcher<'a> {
                             &filters,
                         );
                     }
+                }
+                ScanTarget::AstDiscoveredValue(haystack) => {
+                    if let Some(rule_id) = ast_rule_id_usize {
+                        // 我们找到了 "ast.suspicious-variable" 规则
+                        let rule = Arc::clone(&self.rules_db.rules[rule_id]);
+                        let re = &self.rules_db.anchored_regexes[rule_id];
+
+                        // let rule_syntax = RuleSyntax {
+                        //     name: "AST".to_owned(),
+                        //     id: "ast.suspicious-variable".to_owned(),
+                        //     pattern: ".*".to_owned(),
+                        //     min_entropy: 0.1,
+                        //     confidence: crate::rules::rule::Confidence::Medium,
+                        //     visible: true,
+                        //     examples: vec![],
+                        //     negative_examples: vec![],
+                        //     references: vec![],
+                        //     validation: None,
+                        //     depends_on_rule: vec![],
+                        // };
+                        // let rule = Arc::new(Rule::new(rule_syntax));
+                        // let re = ;
+
+                        // println!(">>> Runing process_captures_pipeline");
+
+                        process_captures_pipeline(
+                            blob.id(),
+                            rule,
+                            re,
+                            rule_id,
+                            redact,
+                            haystack.data,
+                            haystack.start_offset_in_blob,
+                            haystack.is_base64,
+                            &filename,
+                            self.profiler.as_ref(),
+                            &mut final_matches,
+                            &mut filter_context,
+                            &filters,
+                        );
+                    }
+                    // 如果 ast_rule_id_usize 为 None (即规则未找到)，
+                    // 我们就静默地什么也不做，AST 的发现将被忽略。
                 }
             }
         };

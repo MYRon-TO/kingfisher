@@ -144,7 +144,10 @@ pub(crate) fn process_captures_pipeline<'a, 'ctx>(
 
     let initial_len = matches.len();
 
+    // println!(">>> Prepare Runing captures_iter, re: {:?}", re);
     'capture_loop: for captures in re.captures_iter(haystack) {
+        // println!(">>> Runing captures_iter for {:?}", captures);
+
         let full_capture = captures.get(0).unwrap();
         let matching_input = captures.get(1).unwrap_or(full_capture);
         let mi_bytes = matching_input.as_bytes(); // 零拷贝切片
@@ -174,6 +177,7 @@ pub(crate) fn process_captures_pipeline<'a, 'ctx>(
         // ★ 执行可组合的零拷贝管道 ★
         for filter in filters {
             if !filter(&candidate, filter_context) {
+                // println!(">>> Fail in filter");
                 continue 'capture_loop; // 任何一个过滤器失败，则丢弃
             }
         }
@@ -207,7 +211,8 @@ fn promote_to_blob_match(cand: &LightweightCandidate) -> BlobMatch {
         matching_input_offset_span: cand.finding_span_in_blob,
         captures: groups,
         validation_response_body: String::new(),
-        validation_response_status: http::StatusCode::from_u16(0).unwrap_or(http::StatusCode::CONTINUE),
+        validation_response_status: http::StatusCode::from_u16(0)
+            .unwrap_or(http::StatusCode::CONTINUE),
         validation_success: false,
         calculated_entropy: cand.calculated_entropy,
         is_base64: cand.is_base64,
@@ -243,11 +248,11 @@ pub(crate) fn filter_entropy_and_safelist(
 
 /// 过滤器 (阶段 2): 检查行内忽略指令
 #[inline]
-pub(crate) fn filter_inline_ignore(candidate: &LightweightCandidate, ctx: &mut FilterContext) -> bool {
-    if ctx
-        .inline_ignore_config
-        .should_ignore(ctx.blob_bytes, &candidate.finding_span_in_blob)
-    {
+pub(crate) fn filter_inline_ignore(
+    candidate: &LightweightCandidate,
+    ctx: &mut FilterContext,
+) -> bool {
+    if ctx.inline_ignore_config.should_ignore(ctx.blob_bytes, &candidate.finding_span_in_blob) {
         debug!("Skipping match due to inline ignore directive");
         false // 丢弃
     } else {
@@ -269,11 +274,10 @@ pub(crate) fn filter_hash_dedup(candidate: &LightweightCandidate, ctx: &mut Filt
 
 /// 过滤器 (阶段 2): 执行基于重叠 Span 的去重
 #[inline]
-pub(crate) fn filter_overlap_dedup(candidate: &LightweightCandidate, ctx: &mut FilterContext) -> bool {
-    record_match(
-        ctx.previous_matches,
-        candidate.rule_id_usize,
-        candidate.finding_span_in_blob,
-    )
+pub(crate) fn filter_overlap_dedup(
+    candidate: &LightweightCandidate,
+    ctx: &mut FilterContext,
+) -> bool {
+    record_match(ctx.previous_matches, candidate.rule_id_usize, candidate.finding_span_in_blob)
     // record_match() 返回 'true' 如果是新 span
 }

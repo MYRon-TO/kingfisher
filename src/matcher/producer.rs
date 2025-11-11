@@ -48,7 +48,7 @@ pub enum ScanTarget<'a> {
         haystack: Haystack<'a>,
         rule_id_usize: usize,
     },
-    // NoRule(Haystack<'a>),
+    AstDiscoveredValue(Haystack<'a>),
 }
 
 /// 传递给每个生产者的只读上下文。
@@ -212,11 +212,13 @@ impl HaystackProducer for ASTProducer {
         let Some(lang_str) = context.lang_hint.as_deref() else {
             return;
         };
+
+        // println(">>> ASTProducer: Running for language: {}", lang_str);
+
         let Ok(language_enum) = Language::from_str(lang_str) else {
+            // println(">>> ASTProducer: FAILED to parse Language::from_str");
             return;
         };
-
-        // --- ★ 逻辑顺序修复 ★ ---
 
         // 2. ★ (原 步骤 3) 先获取 ts_language (借用 language_enum)
         let Ok(ts_language) = language_enum.get_ts_language() else {
@@ -237,12 +239,18 @@ impl HaystackProducer for ASTProducer {
 
         // ★ 关键: `tree` 必须在 `source_bytes` 之前声明
         // 尽管 Rust 不强制，但这更清晰
-        let Some(tree) = ts_parser.parse(context.blob.bytes(), None) else { return };
+        let Some(tree) = ts_parser.parse(context.blob.bytes(), None) else {
+            // println(">>> ASTProducer: FAILED to parse tree (file: {})", context.filename);
+            return;
+        };
         let root_node = tree.root_node();
         let source_bytes = context.blob.bytes();
 
+        // println(">>> ASTProducer: Tree parsed successfully (file: {})", context.filename);
+
         // 5. 动态编译查询
         let Ok(assign_query) = Query::new(&ts_language, lang_pack.assignment_query) else {
+            // println(">>> ASTProducer: FAILED to compile query (file: {})", context.filename);
             return; // 查询编译失败
         };
 
@@ -268,6 +276,8 @@ impl HaystackProducer for ASTProducer {
 
             if let (Some(name_node), Some(value_node)) = (name_node, value_node) {
                 if let Ok(name) = name_node.utf8_text(source_bytes) {
+                    // println(">>> ASTProducer: Found assignment for: {}", name);
+
                     // ★ 现在 `parse_expression_recursive` 的生命周期解耦了 ★
                     // node(value_node) 的生命周期 ('tree) 和
                     // source(source_bytes) 的生命周期 ('ctx)
@@ -287,18 +297,22 @@ impl HaystackProducer for ASTProducer {
         // --- 阶段 2: 使用图（启发式推断）---
         // (此阶段完全不变)
         for symbol in symbol_table.values() {
-            if is_suspicious_var_name(&symbol.name) {
-                let mut visited = FxHashSet::default();
-                if let Some(resolved_string) =
-                    resolve_value(&symbol.value, &symbol_table, &mut visited)
-                {
-                    consumer(ScanTarget::AllRules(Haystack {
-                        data: resolved_string.as_bytes(),
-                        start_offset_in_blob: symbol.defined_at_offset,
-                        is_base64: false,
-                    }));
-                }
+            // if is_suspicious_var_name(&symbol.name) {
+
+            // println(">>> ASTProducer: Variable IS suspicious: {}", symbol.name);
+
+            let mut visited = FxHashSet::default();
+            if let Some(resolved_string) = resolve_value(&symbol.value, &symbol_table, &mut visited)
+            {
+                // println(">>> ASTProducer: SUCCESS, resolving and consuming: {}", symbol.name);
+
+                consumer(ScanTarget::AstDiscoveredValue(Haystack {
+                    data: resolved_string.as_bytes(),
+                    start_offset_in_blob: symbol.defined_at_offset,
+                    is_base64: false,
+                }));
             }
+            // }
         }
     }
 }
